@@ -1,0 +1,58 @@
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: curio
+      POSTGRES_USER: curio
+      POSTGRES_PASSWORD: curio
+    volumes:
+      - curio_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U curio -d curio"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - curio_redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  backend:
+    image: curio:latest
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    user: "${CURIO_UID:-0}:${CURIO_GID:-0}"
+    environment:
+      SERVER_ADDR: ":8080"
+      DATABASE_URL: "postgres://curio:curio@db:5432/curio?sslmode=disable"
+      REDIS_ADDR: "redis:6379"
+      CURIO_DATA_ROOT: "/data/Curio"
+      FRONTEND_ORIGIN: "*"
+      FRONTEND_DIR: "/app/public"
+      TMDB_API_KEY: "${TMDB_API_KEY:-}"
+      NETWORK_PROXY: "${NETWORK_PROXY:-}"
+      CURIO_PLAY_SECRET: "${CURIO_PLAY_SECRET:-change-me}"
+    ports:
+      - "8080:8080"
+      - "8097:8097"
+    volumes:
+      - ./data:/data/Curio
+      - ./config:/config
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  curio_postgres:
+  curio_redis:

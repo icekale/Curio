@@ -1,0 +1,38 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Frontend dependencies and build output
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/.vite-temp/
+frontend/*.tsbuildinfo
+frontend/vite.config.js
+frontend/vite.config.d.ts
+
+# Go build output
+backend/bin/
+bin/
+*.exe
+*.test
+*.out
+
+# Runtime data and generated releases
+/data/
+/config/
+/release/
+/docs/
+/初版.md
+
+# Logs and temporary files
+*.log
+*.tmp
+coverage.out

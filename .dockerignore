@@ -1,0 +1,15 @@
+.git
+.idea
+.vscode
+**/.DS_Store
+**/node_modules
+**/dist
+**/.vite-temp
+**/*.tsbuildinfo
+backend/bin
+bin
+config
+data
+release
+docs
+*.md
