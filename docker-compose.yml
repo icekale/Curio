@@ -2,6 +2,7 @@ services:
   db:
     image: postgres:17-alpine
     environment:
+      TZ: Asia/Shanghai
       POSTGRES_DB: curio
       POSTGRES_USER: curio
       POSTGRES_PASSWORD: curio
@@ -12,10 +13,18 @@ services:
       interval: 5s
       timeout: 5s
       retries: 20
+    restart: unless-stopped
 
   redis:
     image: redis:7-alpine
-    command: ["redis-server", "--appendonly", "yes"]
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --maxmemory
+      - 192mb
+      - --maxmemory-policy
+      - volatile-lru
     volumes:
       - curio_redis:/data
     healthcheck:
@@ -23,29 +32,30 @@ services:
       interval: 5s
       timeout: 5s
       retries: 20
+    restart: unless-stopped
 
-  backend:
-    image: curio:latest
-    build:
-      context: .
-      dockerfile: backend/Dockerfile
-    user: "${CURIO_UID:-0}:${CURIO_GID:-0}"
+  curio:
+    image: mon3trd/curio:latest
+    user: "0:0"
     environment:
+      TZ: Asia/Shanghai
       SERVER_ADDR: ":8080"
       DATABASE_URL: "postgres://curio:curio@db:5432/curio?sslmode=disable"
       REDIS_ADDR: "redis:6379"
       CURIO_DATA_ROOT: "/data/Curio"
       FRONTEND_ORIGIN: "*"
       FRONTEND_DIR: "/app/public"
-      TMDB_API_KEY: "${TMDB_API_KEY:-}"
-      NETWORK_PROXY: "${NETWORK_PROXY:-}"
-      CURIO_PLAY_SECRET: "${CURIO_PLAY_SECRET:-change-me}"
+      TMDB_API_KEY: ""
+      NETWORK_PROXY: ""
+      CURIO_PLAY_SECRET: "change-me"
     ports:
       - "8080:8080"
       - "8097:8097"
     volumes:
       - ./data:/data/Curio
       - ./config:/config
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       db:
         condition: service_healthy
