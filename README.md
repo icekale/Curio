@@ -22,19 +22,35 @@ Curio 由以下服务组成：
 ## 2. 快速启动
 
 1. 准备 Docker 和 Docker Compose。
-2. 在项目目录启动：
+2. 获取项目：
+
+```bash
+git clone https://github.com/Mon3tr-v/Curio.git
+cd Curio
+```
+
+3. 按需修改 `docker-compose.yml`：
+
+- 默认镜像：`mon3trd/curio:latest`
+- Web 端口：`8080`
+- Emby 反代端口：`8097`
+- 数据目录：`./data`
+- 配置目录：`./config`
+- 首次部署建议把 `CURIO_PLAY_SECRET` 改成随机长字符串。
+
+4. 启动：
 
 ```bash
 docker compose up -d
 ```
 
-3. 打开：
+5. 打开：
 
 ```text
 http://localhost:8080
 ```
 
-4. 首次进入后先配置 `设置` 页面。
+6. 首次进入后先配置 `设置` 页面。
 
 ## 3. 首次配置
 
@@ -447,24 +463,38 @@ http://localhost:8080/play/115/电影名.iso?token=签名token
 - ffmpeg / ffprobe
 - CA 证书
 
-推荐标签：
+默认 Compose 使用镜像：
 
 ```text
-curio:1.0.0
-curio:latest
-curio:1.0.0-amd64
-curio:1.0.0-arm64
-curio:latest-amd64
-curio:latest-arm64
+mon3trd/curio:latest
 ```
 
-运行：
+使用仓库内的 `docker-compose.yml` 运行：
 
 ```bash
 docker compose up -d
 ```
 
-或单独运行 backend：
+默认会启动：
+
+- `db`：PostgreSQL 17，保存 Curio 数据。
+- `redis`：Redis 7，开启 AOF，并限制缓存内存为 `192mb`。
+- `curio`：Curio 主服务，对外暴露 `8080` 和 `8097`。
+
+默认挂载：
+
+- `./data:/data/Curio`
+- `./config:/config`
+- `curio_postgres:/var/lib/postgresql/data`
+- `curio_redis:/data`
+
+如果 Curio 需要访问宿主机代理，可以在页面设置中填写：
+
+```text
+http://host.docker.internal:7890
+```
+
+或单独运行 Curio 主服务：
 
 ```bash
 docker run -d \
@@ -476,9 +506,13 @@ docker run -d \
   -e REDIS_ADDR='redis:6379' \
   -e FRONTEND_DIR=/app/public \
   -e CURIO_DATA_ROOT=/data/Curio \
+  -e CURIO_PLAY_SECRET='change-me' \
   -v ./data:/data/Curio \
-  curio:latest
+  -v ./config:/config \
+  mon3trd/curio:latest
 ```
+
+单独运行时仍需要准备可访问的 PostgreSQL 和 Redis。
 
 ## 9. 安全建议
 
