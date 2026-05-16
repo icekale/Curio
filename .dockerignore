@@ -11,5 +11,10 @@ bin
 config
 data
 release
+releases
+backups
+.tmp-*
+scripts
+docker-compose.release.*.yml
 docs
 *.md

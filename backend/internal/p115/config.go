@@ -168,10 +168,27 @@ func NormalizeCookieLoginApp(value string) string {
 	return "wechatmini"
 }
 
-func userAgent(_ models.P115Settings, fallback string) string {
+func userAgent(settings models.P115Settings, fallback string) string {
+	mode := strings.ToLower(strings.TrimSpace(settings.UserAgentMode))
+	fixed := strings.TrimSpace(settings.FixedUserAgent)
+	switch mode {
+	case "fixed":
+		if fixed != "" {
+			return fixed
+		}
+	case "default":
+		return defaultUserAgent
+	}
 	if strings.TrimSpace(fallback) != "" {
 		return strings.TrimSpace(fallback)
 	}
+	if fixed != "" {
+		return fixed
+	}
+	return defaultUserAgent
+}
+
+func DefaultUserAgent() string {
 	return defaultUserAgent
 }
 

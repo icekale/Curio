@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -23,6 +22,7 @@ import (
 	"curio/internal/models"
 	"curio/internal/naming"
 	"curio/internal/p115"
+	"curio/internal/playdiag"
 	"curio/internal/repository"
 	"curio/internal/scraper"
 	"curio/internal/worker"
@@ -109,6 +109,7 @@ func NewWithP115(store *repository.Store, workerService *worker.Service, scraper
 	router.Post("/api/p115/strm/sync", api.syncP115STRM)
 	router.Post("/api/p115/strm/cleanup", api.cleanupP115STRM)
 	router.Get("/api/p115/sync-runs", api.p115SyncRuns)
+	router.Get("/api/p115/playback/logs", api.p115PlaybackLogs)
 	router.Get("/api/settings/classification", api.classification)
 	router.Put("/api/settings/classification", api.saveClassification)
 	router.Get("/api/settings/templates", api.templates)
@@ -454,7 +455,10 @@ func (a *API) p115Settings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	settings = normalizeEmbyPortSettings(settings)
+	settings.EmbyPublicURL = ""
+	if settings.EmbyProxyPort <= 0 {
+		settings.EmbyProxyPort = 8097
+	}
 	settings.CookieLoginApp = p115.NormalizeCookieLoginApp(settings.CookieLoginApp)
 	writeJSON(w, http.StatusOK, redactP115Settings(settings))
 }
@@ -637,6 +641,11 @@ func (a *API) p115SyncRuns(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, runs)
 }
 
+func (a *API) p115PlaybackLogs(w http.ResponseWriter, r *http.Request) {
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	writeJSON(w, http.StatusOK, map[string]any{"items": playdiag.Records(limit)})
+}
+
 func (a *API) play115(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
@@ -654,12 +663,40 @@ func (a *API) play115(w http.ResponseWriter, r *http.Request) {
 		directURL, err = a.p115.ResolvePlayURLFromRoute(ctx, route, requestBaseURL(r), r.UserAgent())
 	}
 	if err != nil {
+		logPlay115(r, "", err.Error())
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Location", directURL)
+	logPlay115(r, directURL, "")
+	writePlayRedirect(w, directURL)
+}
+
+func writePlayRedirect(w http.ResponseWriter, directURL string) {
+	h := w.Header()
+	h.Set("Cache-Control", "no-store, no-cache, must-revalidate")
+	h.Set("Pragma", "no-cache")
+	h.Set("Expires", "0")
+	h.Set("Vary", "User-Agent")
+	h.Set("Access-Control-Allow-Origin", "*")
+	h.Set("Access-Control-Expose-Headers", "Location")
+	h.Set("Location", directURL)
+	h.Set("X-Curio-Redirect", "115")
 	w.WriteHeader(http.StatusFound)
+}
+
+func logPlay115(r *http.Request, directURL, errText string) {
+	if r == nil {
+		return
+	}
+	targetHost := ""
+	if parsed, err := url.Parse(directURL); err == nil {
+		targetHost = parsed.Host
+	}
+	if errText != "" {
+		playdiag.Printf("curio play api failed method=%s path=%q ua=%q err=%s", r.Method, r.URL.RequestURI(), r.UserAgent(), errText)
+		return
+	}
+	playdiag.Printf("curio play api redirect method=%s path=%q ua=%q target_host=%q", r.Method, r.URL.RequestURI(), r.UserAgent(), targetHost)
 }
 
 func (a *API) classification(w http.ResponseWriter, r *http.Request) {
@@ -1191,8 +1228,8 @@ func validateP115Settings(settings models.P115Settings) (models.P115Settings, er
 		settings.STRMOutputPath = "/data/Curio/strm"
 	}
 	settings.PublicBaseURL = strings.TrimRight(strings.TrimSpace(settings.PublicBaseURL), "/")
-	settings.EmbyPublicURL = strings.TrimRight(strings.TrimSpace(settings.EmbyPublicURL), "/")
-	for label, raw := range map[string]string{"播放外部地址": settings.PublicBaseURL, "Emby 对外地址": settings.EmbyPublicURL} {
+	settings.EmbyPublicURL = ""
+	for label, raw := range map[string]string{"STRM 生成地址": settings.PublicBaseURL} {
 		if raw == "" {
 			continue
 		}
@@ -1201,7 +1238,7 @@ func validateP115Settings(settings models.P115Settings) (models.P115Settings, er
 			return models.P115Settings{}, errors.New(label + "无效")
 		}
 	}
-	settings.DirectURLTTLSeconds = 300
+	settings.DirectURLTTLSeconds = 3000
 	settings.UserAgentMode = "inherit"
 	settings.FixedUserAgent = ""
 	settings.LibrariesYAML = strings.TrimSpace(settings.LibrariesYAML)
@@ -1237,35 +1274,7 @@ func validateP115Settings(settings models.P115Settings) (models.P115Settings, er
 		settings.EmbyProxyBasePath = "/emby"
 	}
 	settings.EmbyAPIKey = strings.TrimSpace(settings.EmbyAPIKey)
-	return normalizeEmbyPortSettings(settings), nil
-}
-
-func normalizeEmbyPortSettings(settings models.P115Settings) models.P115Settings {
-	if settings.EmbyProxyPort <= 0 {
-		settings.EmbyProxyPort = 8097
-	}
-	parsed, err := url.Parse(strings.TrimSpace(settings.EmbyPublicURL))
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return settings
-	}
-	rewrite := strings.TrimRight(parsed.Path, "/") == "/emby"
-	if upstream, err := url.Parse(strings.TrimSpace(settings.EmbyUpstreamURL)); err == nil {
-		rewrite = rewrite || (upstream.Scheme != "" &&
-			strings.EqualFold(parsed.Hostname(), upstream.Hostname()) &&
-			parsed.Port() != "" &&
-			parsed.Port() == upstream.Port())
-	}
-	if !rewrite {
-		return settings
-	}
-	if host := parsed.Hostname(); host != "" {
-		parsed.Host = net.JoinHostPort(host, strconv.Itoa(settings.EmbyProxyPort))
-	}
-	parsed.Path = ""
-	parsed.RawQuery = ""
-	parsed.Fragment = ""
-	settings.EmbyPublicURL = strings.TrimRight(parsed.String(), "/")
-	return settings
+	return settings, nil
 }
 
 func clampInt(value, min, max, fallback int) int {

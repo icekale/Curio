@@ -1628,8 +1628,13 @@ pre {
   position: fixed;
   top: 18px;
   right: 22px;
-  z-index: 20;
+  bottom: auto;
+  left: auto;
+  z-index: 100;
+  display: grid;
+  justify-items: end;
   width: min(360px, calc(100vw - 32px));
+  max-width: calc(100vw - 32px);
   pointer-events: none;
 }
 

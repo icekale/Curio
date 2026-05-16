@@ -1,4 +1,5 @@
 import { AnimatePresence, motion } from 'framer-motion';
+import { createPortal } from 'react-dom';
 import {
   Activity,
   AlertTriangle,
@@ -1329,16 +1330,16 @@ function AuthScreen({
 
 function ToastHost({ toast }: { toast: ToastState | null }) {
   const Icon = toast?.tone === 'error' ? XCircle : toast?.tone === 'success' ? CheckCircle2 : Activity;
-  return (
+  return createPortal(
     <div className="toastStack" aria-live="polite" aria-atomic="true">
       <AnimatePresence>
         {toast && (
           <motion.div
             className={`toast ${toast.tone}`}
             key={toast.id}
-            initial={{ opacity: 0, y: -12, scale: 0.98 }}
-            animate={{ opacity: 1, y: 0, scale: 1 }}
-            exit={{ opacity: 0, y: -10, scale: 0.98 }}
+            initial={{ opacity: 0, x: 16, y: -8, scale: 0.98 }}
+            animate={{ opacity: 1, x: 0, y: 0, scale: 1 }}
+            exit={{ opacity: 0, x: 16, y: -8, scale: 0.98 }}
             transition={{ duration: 0.2, ease: [0.2, 0, 0, 1] }}
           >
             <Icon size={18} />
@@ -1346,7 +1347,8 @@ function ToastHost({ toast }: { toast: ToastState | null }) {
           </motion.div>
         )}
       </AnimatePresence>
-    </div>
+    </div>,
+    document.body,
   );
 }
 
@@ -2437,11 +2439,10 @@ function SettingsPage({
     ['app_secret', 'App Secret', ''],
     ['cookies', 'Cookies', 'UID=...; CID=...; SEID=...'],
     ['strm_output_path', 'STRM 输出目录', '/data/Curio/strm'],
-    ['public_base_url', 'Curio 外部地址', 'http://curio.example.com'],
+    ['public_base_url', 'STRM 生成地址', 'http://172.16.0.1:8080'],
   ];
   const embyFields: [P115TextKey, string, string][] = [
     ['emby_upstream_url', 'Emby 原始地址', 'http://emby:8096'],
-    ['emby_public_url', 'Emby 对外地址', 'http://curio.example.com:8097'],
     ['emby_api_key', 'API Key', ''],
   ];
   const p115CID = p115CIDFromConfig(p115Settings.libraries_yaml);

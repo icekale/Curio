@@ -19,7 +19,10 @@ import (
 	"time"
 
 	"curio/internal/models"
+	"curio/internal/playdiag"
 	"curio/internal/repository"
+
+	"golang.org/x/sync/singleflight"
 )
 
 type Service struct {
@@ -27,6 +30,7 @@ type Service struct {
 	syncMu        sync.Mutex
 	cacheMu       sync.Mutex
 	directCache   map[string]cachedDirectURL
+	directGroup   singleflight.Group
 	authMu        sync.Mutex
 	qrSessions    map[string]qrAuthSession
 	oauthSessions map[string]oauthSession
@@ -35,6 +39,11 @@ type Service struct {
 type cachedDirectURL struct {
 	URL       string
 	ExpiresAt time.Time
+}
+
+type directResolveResult struct {
+	URL    string
+	Source string
 }
 
 type qrAuthSession struct {
@@ -53,7 +62,10 @@ type oauthSession struct {
 	ExpiresAt   time.Time
 }
 
-const defaultDirectURLTTL = 5 * time.Minute
+const (
+	defaultDirectURLTTL       = 50 * time.Minute
+	legacyDirectURLTTLSeconds = 300
+)
 
 func NewService(store *repository.Store) *Service {
 	return &Service{
@@ -496,11 +508,11 @@ func (s *Service) PlayURLForLink(linkID, baseURL string) (string, error) {
 }
 
 func (s *Service) PlayURLForLinkName(linkID, baseURL, displayName string) (string, error) {
-	name := cleanPlayDisplayName(displayName)
-	if name == "" {
-		name = path.Join("id", strings.TrimSpace(linkID))
+	linkID = strings.TrimSpace(linkID)
+	if linkID == "" {
+		return "", errors.New("STRM 链接 ID 为空")
 	}
-	return joinPublicURLReadable(baseURL, "/play/115/"+name), nil
+	return joinPublicURLReadable(baseURL, "/play/115/id/"+linkID+"/"+playRouteFileName(linkID, displayName)), nil
 }
 
 func (s *Service) LinkIDFromToken(token string) (string, error) {
@@ -523,17 +535,14 @@ func (s *Service) ResolvePlayURLFromRoute(ctx context.Context, route, baseURL, r
 	if linkID, err := verifyPlayToken(route); err == nil {
 		return s.resolvePlayURLByLinkID(ctx, linkID, requestUserAgent)
 	}
-	if strings.HasPrefix(route, "id/") {
-		linkID := strings.TrimSpace(strings.TrimPrefix(route, "id/"))
-		if linkID != "" {
-			return s.resolvePlayURLByLinkID(ctx, linkID, requestUserAgent)
-		}
+	if linkID := linkIDFromPlayRoute(route); linkID != "" {
+		return s.resolvePlayURLByLinkID(ctx, linkID, requestUserAgent)
 	}
 	settings, cfg, err := s.settingsAndLibraries(ctx)
 	if err != nil {
 		return "", err
 	}
-	link, err := s.store.STRMLinkByPlayRoute(ctx, models.STRMProvider115, route, playPathCandidates(baseURL, route))
+	link, err := s.store.STRMLinkByPlayRoute(ctx, models.STRMProvider115, route, playPathCandidatesForBases(route, baseURL, settings.PublicBaseURL))
 	if err != nil {
 		return "", err
 	}
@@ -553,6 +562,7 @@ func (s *Service) resolvePlayURLByLinkID(ctx context.Context, linkID, requestUse
 }
 
 func (s *Service) resolvePlayURLForLink(ctx context.Context, settings models.P115Settings, cfg LibrariesConfig, link models.STRMLink, requestUserAgent string) (string, error) {
+	started := time.Now()
 	if link.Provider != models.STRMProvider115 || link.Status != models.STRMStatusGenerated {
 		return "", errors.New("STRM 链接不可播放")
 	}
@@ -577,14 +587,38 @@ func (s *Service) resolvePlayURLForLink(ctx context.Context, settings models.P11
 	}
 	ua := userAgent(settings, requestUserAgent)
 	if directURL, ok := s.cachedDirectURL(link.PickCode, ua); ok {
+		logDirectResolve(link, requestUserAgent, ua, "cache-hit", false, directURL, time.Since(started), "")
 		return directURL, nil
 	}
-	directURL, err := client.DirectURL(ctx, link.PickCode, ua)
+	cacheKey := directCacheKey(link.PickCode, ua)
+	value, err, shared := s.directGroup.Do(cacheKey, func() (any, error) {
+		if directURL, ok := s.cachedDirectURL(link.PickCode, ua); ok {
+			return directResolveResult{URL: directURL, Source: "cache-hit-after-wait"}, nil
+		}
+		directURL, err := client.DirectURL(ctx, link.PickCode, ua)
+		if err != nil {
+			_ = s.store.MarkSTRMLinkStatus(ctx, link.ID, link.Status, models.STRMResolveFailed, "DIRECT_URL_FAILED", err.Error())
+			return directResolveResult{}, err
+		}
+		s.rememberDirectURL(link.PickCode, ua, directURL, directURLTTL(settings))
+		return directResolveResult{URL: directURL, Source: "115-api"}, nil
+	})
 	if err != nil {
-		_ = s.store.MarkSTRMLinkStatus(ctx, link.ID, link.Status, models.STRMResolveFailed, "DIRECT_URL_FAILED", err.Error())
+		logDirectResolve(link, requestUserAgent, ua, "failed", shared, "", time.Since(started), err.Error())
 		return "", err
 	}
-	s.rememberDirectURL(link.PickCode, ua, directURL, defaultDirectURLTTL)
+	result, _ := value.(directResolveResult)
+	directURL := result.URL
+	if strings.TrimSpace(directURL) == "" {
+		err := errors.New("115 未返回可用直链")
+		logDirectResolve(link, requestUserAgent, ua, "empty", shared, "", time.Since(started), err.Error())
+		return "", err
+	}
+	source := result.Source
+	if source == "" {
+		source = "unknown"
+	}
+	logDirectResolve(link, requestUserAgent, ua, source, shared, directURL, time.Since(started), "")
 	return directURL, nil
 }
 
@@ -1209,9 +1243,6 @@ func playBaseURL(settings models.P115Settings, fallbackBaseURL string) string {
 	if value := strings.TrimSpace(settings.PublicBaseURL); value != "" {
 		return value
 	}
-	if value := strings.TrimSpace(settings.EmbyPublicURL); value != "" {
-		return value
-	}
 	return fallbackBaseURL
 }
 
@@ -1245,6 +1276,35 @@ func sourceHash(libraryCID, relativePath, fileID, pickcode, sha1 string, size in
 func directCacheKey(pickcode, userAgentValue string) string {
 	sum := sha256.Sum256([]byte(userAgentValue))
 	return pickcode + ":" + hex.EncodeToString(sum[:])
+}
+
+func directURLTTL(settings models.P115Settings) time.Duration {
+	if settings.DirectURLTTLSeconds <= 0 || settings.DirectURLTTLSeconds == legacyDirectURLTTLSeconds {
+		return defaultDirectURLTTL
+	}
+	return time.Duration(settings.DirectURLTTLSeconds) * time.Second
+}
+
+func logDirectResolve(link models.STRMLink, requestUA, effectiveUA, source string, shared bool, directURL string, elapsed time.Duration, errText string) {
+	targetHost := ""
+	if parsed, err := url.Parse(directURL); err == nil {
+		targetHost = parsed.Host
+	}
+	fields := fmt.Sprintf("link=%s source=%s shared=%t request_ua=%q effective_ua=%q target_host=%q elapsed_ms=%d",
+		shortLogValue(link.ID, 16), source, shared, shortLogValue(requestUA, 120), shortLogValue(effectiveUA, 120), targetHost, elapsed.Milliseconds())
+	if errText != "" {
+		playdiag.Printf("curio play p115 resolve failed %s err=%s", fields, errText)
+		return
+	}
+	playdiag.Printf("curio play p115 resolve ok %s", fields)
+}
+
+func shortLogValue(value string, limit int) string {
+	value = strings.TrimSpace(value)
+	if limit <= 0 || len(value) <= limit {
+		return value
+	}
+	return value[:limit] + "..."
 }
 
 func refreshEmby(ctx context.Context, settings models.P115Settings) error {
@@ -1450,6 +1510,27 @@ func cleanPlayDisplayName(displayName string) string {
 	return path.Join(parts...)
 }
 
+func linkIDFromPlayRoute(route string) string {
+	route = strings.Trim(strings.ReplaceAll(route, "\\", "/"), "/")
+	if !strings.HasPrefix(route, "id/") {
+		return ""
+	}
+	rest := strings.TrimPrefix(route, "id/")
+	if cut := strings.IndexByte(rest, '/'); cut >= 0 {
+		rest = rest[:cut]
+	}
+	return strings.TrimSpace(rest)
+}
+
+func playRouteFileName(linkID, displayName string) string {
+	name := cleanPlayDisplayName(displayName)
+	ext := strings.ToLower(path.Ext(name))
+	if ext != "" && mediaExtension(ext) {
+		return linkID + ext
+	}
+	return linkID
+}
+
 func playPathCandidates(baseURL, route string) []string {
 	route = cleanPlayDisplayName(route)
 	if route == "" {
@@ -1475,6 +1556,21 @@ func playPathCandidates(baseURL, route string) []string {
 		}
 		seen[value] = struct{}{}
 		out = append(out, value)
+	}
+	return out
+}
+
+func playPathCandidatesForBases(route string, bases ...string) []string {
+	out := make([]string, 0)
+	seen := map[string]struct{}{}
+	for _, base := range bases {
+		for _, value := range playPathCandidates(base, route) {
+			if _, ok := seen[value]; ok {
+				continue
+			}
+			seen[value] = struct{}{}
+			out = append(out, value)
+		}
 	}
 	return out
 }

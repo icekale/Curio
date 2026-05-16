@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"path"
 	"strings"
 	"time"
 
@@ -64,7 +65,7 @@ func (s *Store) Migrate(ctx context.Context) error {
 			cookie_login_app TEXT NOT NULL DEFAULT 'wechatmini',
 			strm_output_path TEXT NOT NULL DEFAULT '/data/Curio/strm',
 			public_base_url TEXT NOT NULL DEFAULT '',
-			direct_url_ttl_seconds INT NOT NULL DEFAULT 300,
+			direct_url_ttl_seconds INT NOT NULL DEFAULT 3000,
 			user_agent_mode TEXT NOT NULL DEFAULT 'inherit',
 			fixed_user_agent TEXT NOT NULL DEFAULT '',
 			libraries_yaml TEXT NOT NULL DEFAULT '',
@@ -555,7 +556,7 @@ func (s *Store) P115Settings(ctx context.Context) (models.P115Settings, error) {
 			AuthMode:            "cookies",
 			CookieLoginApp:      "wechatmini",
 			STRMOutputPath:      "/data/Curio/strm",
-			DirectURLTTLSeconds: 300,
+			DirectURLTTLSeconds: 3000,
 			UserAgentMode:       "inherit",
 			DeleteMissingSTRM:   true,
 			KeepDeletedDays:     7,
@@ -705,6 +706,43 @@ func (s *Store) STRMLinkByEmbyItem(ctx context.Context, serverID, itemID string)
 		return models.STRMLink{}, pgx.ErrNoRows
 	}
 	return scanSTRMLink(rows)
+}
+
+func (s *Store) NextSTRMLinks(ctx context.Context, link models.STRMLink, limit int) ([]models.STRMLink, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	relativePath := strings.Trim(strings.ReplaceAll(link.RelativePath, "\\", "/"), "/")
+	if relativePath == "" {
+		return nil, nil
+	}
+	dir := path.Dir(relativePath)
+	if dir == "." || dir == "/" {
+		return nil, nil
+	}
+	prefix := strings.TrimRight(dir, "/") + "/"
+	rows, err := s.db.Query(ctx, `SELECT id, provider, library_cid, library_name, library_type, relative_path, remote_path,
+		remote_file_id, pickcode, sha1, size, strm_path, play_path, source_tree_hash, tree_version, resolve_status, status,
+		error_code, error_message, generated_at, resolved_at, updated_at
+		FROM strm_links
+		WHERE provider=$1 AND library_cid=$2 AND status=$3
+			AND relative_path>$4
+			AND left(relative_path, length($5))=$5
+		ORDER BY relative_path ASC
+		LIMIT $6`, link.Provider, link.LibraryCID, models.STRMStatusGenerated, relativePath, prefix, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	links := make([]models.STRMLink, 0, limit)
+	for rows.Next() {
+		next, err := scanSTRMLink(rows)
+		if err != nil {
+			return nil, err
+		}
+		links = append(links, next)
+	}
+	return links, rows.Err()
 }
 
 func (s *Store) ActiveSTRMLinksByLibrary(ctx context.Context, provider, libraryCID string) ([]models.STRMLink, error) {

@@ -35,7 +35,7 @@ services:
     restart: unless-stopped
 
   curio:
-    image: mon3trd/curio:latest
+    image: mon3trd/curio:1.0.2
     user: "0:0"
     environment:
       TZ: Asia/Shanghai

@@ -29,6 +29,10 @@ bin/
 /data/
 /config/
 /release/
+/releases/
+/backups/
+/scripts/
+/docker-compose.release.*.yml
 /docs/
 /初版.md
 
