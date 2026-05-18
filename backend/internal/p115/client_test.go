@@ -2,11 +2,15 @@ package p115
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"testing"
 
 	"curio/internal/models"
+
+	"golang.org/x/text/encoding/unicode"
+	"golang.org/x/text/transform"
 )
 
 func TestFileInfoFromOpenFolderMap(t *testing.T) {
@@ -219,6 +223,75 @@ func TestLifeEventStartTimeAppliesLookback(t *testing.T) {
 	}
 }
 
+func TestExportTreeDownload403IsRetryable(t *testing.T) {
+	if !isRetryableExportTreeDownloadError(errors.New("115 下载目录树失败：HTTP 403")) {
+		t.Fatal("expected export tree HTTP 403 download failures to be retryable")
+	}
+	if isRetryableExportTreeDownloadError(errors.New("115 目录树导出结果缺少 pickcode")) {
+		t.Fatal("expected missing pickcode to remain a hard failure")
+	}
+}
+
+func TestParseExportTreeDetectsDottedDirectoryByChildren(t *testing.T) {
+	data := utf16ExportTree(t, strings.Join([]string{
+		"|——根目录",
+		"| |-media",
+		"| | |-movies",
+		"| | | |-梅根2.0 (2025)",
+		"| | | | |-梅根2.0 (2025).mkv",
+	}, "\n"))
+	items, err := parseExportTree(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byPath := map[string]TreeItem{}
+	for _, item := range items {
+		byPath[item.RelativePath] = item
+	}
+	dir := byPath["media/movies/梅根2.0 (2025)"]
+	if !dir.IsDirectory {
+		t.Fatalf("expected dotted folder to be detected as directory, got %#v", dir)
+	}
+	if !isMediaTreeItem(byPath["media/movies/梅根2.0 (2025)/梅根2.0 (2025).mkv"]) {
+		t.Fatalf("expected media file, got %#v", byPath)
+	}
+}
+
+func TestStripExportRootDirectoryRemovesSelectedCIDRoot(t *testing.T) {
+	items := []TreeItem{
+		{RelativePath: "media", Name: "media", Depth: 1, IsDirectory: true},
+		{RelativePath: "media/movies", Name: "movies", Depth: 2, IsDirectory: true},
+		{RelativePath: "media/movies/A.mkv", Name: "A.mkv", Depth: 3},
+		{RelativePath: "media/tv", Name: "tv", Depth: 2, IsDirectory: true},
+	}
+
+	got := stripExportRootDirectory(items)
+
+	paths := make([]string, 0, len(got))
+	for _, item := range got {
+		paths = append(paths, item.RelativePath)
+		if item.RelativePath == "movies/A.mkv" && item.Depth != 2 {
+			t.Fatalf("expected stripped depth 2, got %#v", item)
+		}
+	}
+	want := []string{"movies", "movies/A.mkv", "tv"}
+	if strings.Join(paths, "|") != strings.Join(want, "|") {
+		t.Fatalf("unexpected stripped paths %#v", paths)
+	}
+}
+
+func TestStripExportRootDirectoryKeepsMultipleTopLevelFolders(t *testing.T) {
+	items := []TreeItem{
+		{RelativePath: "movies", Name: "movies", Depth: 1, IsDirectory: true},
+		{RelativePath: "tv", Name: "tv", Depth: 1, IsDirectory: true},
+	}
+
+	got := stripExportRootDirectory(items)
+	if len(got) != len(items) || got[0].RelativePath != "movies" || got[1].RelativePath != "tv" {
+		t.Fatalf("expected multiple top-level folders to stay unchanged, got %#v", got)
+	}
+}
+
 func decodeMap(t *testing.T, raw string) map[string]any {
 	t.Helper()
 	var row map[string]any
@@ -228,4 +301,14 @@ func decodeMap(t *testing.T, raw string) map[string]any {
 		t.Fatal(err)
 	}
 	return row
+}
+
+func utf16ExportTree(t *testing.T, text string) []byte {
+	t.Helper()
+	encoder := unicode.UTF16(unicode.LittleEndian, unicode.UseBOM).NewEncoder()
+	data, _, err := transform.Bytes(encoder, []byte(text))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
 }

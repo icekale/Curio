@@ -64,6 +64,7 @@ type LifeEventBatch struct {
 	LastEventID   int64
 	LastEventTime int64
 	RawCount      int
+	Source        string
 }
 
 type openQRCodeSession struct {
@@ -129,6 +130,16 @@ const lifeEventLookbackSeconds = 3600
 
 var p115RequestThrottle = newP115Throttle(500 * time.Millisecond)
 
+const (
+	exportTreePollTimeout    = 30 * time.Minute
+	exportTreeCheckTimeout   = 8 * time.Second
+	exportTreePollInterval   = 5 * time.Second
+	exportTreeDownloadTries  = 4
+	exportTreeDownloadMaxLag = 45 * time.Second
+)
+
+var errExportTreePending = errors.New("115 目录树导出仍在准备中")
+
 type Client struct {
 	settings models.P115Settings
 	http     *http.Client
@@ -146,34 +157,55 @@ func NewClient(settings models.P115Settings) *Client {
 func (c *Client) Status(ctx context.Context) (models.P115Status, error) {
 	status := models.P115Status{
 		Ready:     c.settings.Enabled,
-		CanExport: c.hasOpenToken() || c.hasCookies(),
+		CanExport: false,
 		CanPlay:   c.hasOpenToken() || c.hasCookies(),
 	}
 	if !c.settings.Enabled {
 		status.Message = "115 播放未启用"
 		return status, nil
 	}
+	messages := make([]string, 0, 2)
 	if c.hasCookies() {
-		if _, err := c.listCookie(ctx, "0"); err == nil {
-			status.Ready = true
-			status.Message = "115 Cookies 已连接"
-			return status, nil
-		} else if !c.hasOpenToken() {
-			return status, err
+		if _, err := c.listCookie(ctx, "0"); err != nil {
+			status.CookieError = "Cookies 列目录失败：" + err.Error()
+		} else if lib, err := ParseLibraryCID(c.settings.LibraryCID); err != nil {
+			status.CookieError = err.Error()
+		} else if err := c.CheckExportTree(ctx, lib); err != nil {
+			status.CookieError = "Cookies 目录树导出失败：" + err.Error()
+		} else {
+			status.CookieValid = true
+			status.CanExport = true
+			messages = append(messages, "Cookies 可导出目录树")
 		}
+	} else {
+		status.CookieError = "未配置 Cookies，STRM 同步需要 Cookies 目录树导出"
 	}
 	if c.hasOpenToken() {
 		payload, _, err := c.requestJSON(ctx, http.MethodGet, "https://proapi.115.com/open/user/info", nil, true, "")
 		if err != nil {
-			return status, err
+			status.TokenError = "Open Token 校验失败：" + err.Error()
+		} else if err := payloadError(payload); err != nil {
+			status.TokenError = "Open Token 校验失败：" + err.Error()
+		} else {
+			status.TokenValid = true
+			status.UserName = firstString(payload, "user_name", "name", "nickname", "uid")
+			messages = append(messages, "Open Token 有效")
 		}
-		status.Ready = true
-		status.UserName = firstString(payload, "user_name", "name", "nickname", "uid")
-		status.Message = "115 Open 已连接"
-		return status, nil
+	} else {
+		messages = append(messages, "Open Token 未配置，播放直链将使用 Cookies")
 	}
-	status.Ready = false
-	status.Message = "请配置 115 Cookies 或 Open Access Token"
+	status.CanPlay = status.CookieValid || status.TokenValid
+	status.Ready = status.CanExport && status.CanPlay && (!c.hasOpenToken() || status.TokenValid)
+	if status.CookieError != "" {
+		messages = append(messages, status.CookieError)
+	}
+	if status.TokenError != "" {
+		messages = append(messages, status.TokenError)
+	}
+	if len(messages) == 0 {
+		messages = append(messages, "请配置 115 Cookies 或 Open Access Token")
+	}
+	status.Message = strings.Join(messages, "；")
 	return status, nil
 }
 
@@ -367,33 +399,51 @@ func (c *Client) ScanTree(ctx context.Context, lib LibraryConfig) ([]TreeItem, e
 	return nil, errors.New("115 未配置可用授权")
 }
 
-func (c *Client) ExportTree(ctx context.Context, lib LibraryConfig) ([]TreeItem, error) {
+func (c *Client) ScanSubtree(ctx context.Context, lib LibraryConfig, cid, prefix string, depth int) ([]TreeItem, error) {
+	cid = strings.TrimSpace(cid)
+	if cid == "" {
+		return nil, errors.New("115 子目录 ID 为空")
+	}
+	prefix = strings.Trim(strings.ReplaceAll(prefix, "\\", "/"), "/")
 	if c.hasCookies() {
-		items, err := c.exportTreeByWeb(ctx, lib)
-		if err == nil {
-			return items, nil
-		}
-		if isRateLimitError(err) {
-			return nil, err
-		}
-		scanItems, scanErr := c.ScanTree(ctx, lib)
-		if scanErr == nil {
-			return scanItems, nil
-		}
-		if !c.hasOpenToken() {
-			return nil, fmt.Errorf("115 目录树导出失败：%v；慢速分页兜底也失败：%w", err, scanErr)
-		}
-		items, openErr := c.exportTreeByListWith(ctx, lib, c.listOpen)
-		if openErr == nil {
-			return items, nil
-		}
-		return nil, fmt.Errorf("115 目录树导出失败：%v；Cookies 分页兜底失败：%v；Open 分页兜底也失败：%w", err, scanErr, openErr)
+		return c.scanSubtreeByListWith(ctx, lib, cid, prefix, depth, c.listCookie)
 	}
-	items, openErr := c.exportTreeByListWith(ctx, lib, c.listOpen)
-	if openErr == nil {
-		return items, nil
+	if c.hasOpenToken() {
+		return c.scanSubtreeByListWith(ctx, lib, cid, prefix, depth, c.listOpen)
 	}
-	return nil, fmt.Errorf("Open 分页失败：%w", openErr)
+	return nil, errors.New("115 未配置可用授权")
+}
+
+func (c *Client) ExportTree(ctx context.Context, lib LibraryConfig) ([]TreeItem, error) {
+	if !c.hasCookies() {
+		return nil, errors.New("115 目录树导出需要 Cookies 授权，请先使用 115 Cookies/扫码登录")
+	}
+	return c.exportTreeByWeb(ctx, lib)
+}
+
+func (c *Client) CheckExportTree(ctx context.Context, lib LibraryConfig) error {
+	if !c.hasCookies() {
+		return errors.New("115 目录树导出需要 Cookies 授权，请先使用 115 Cookies/扫码登录")
+	}
+	data, err := c.createExportTreeTask(ctx, lib, 1, "校验目录树导出")
+	if err != nil {
+		return err
+	}
+	exportID := firstString(data, "export_id", "id")
+	if exportID == "" {
+		return errors.New("115 未返回目录树导出任务 ID")
+	}
+	result, err := c.waitExportTreeResult(ctx, exportID, exportTreeCheckTimeout)
+	if err != nil {
+		if errors.Is(err, errExportTreePending) {
+			return nil
+		}
+		return err
+	}
+	if fileID := firstString(result, "file_id", "fid", "id"); fileID != "" {
+		_ = c.deleteWeb(ctx, fileID)
+	}
+	return nil
 }
 
 func (c *Client) ResolvePath(ctx context.Context, cid, relativePath string) (FileInfo, error) {
@@ -490,12 +540,15 @@ func (c *Client) LifeEventsBatch(ctx context.Context, fromID, fromTime int64, ma
 		return LifeEventBatch{}, errors.New("115 操作事件需要 Cookies 授权")
 	}
 	_ = c.ensureLifeEvents(ctx)
-	batch, err := c.lifeBehaviorEventsOnce(ctx, fromID, lifeEventStartTime(fromTime), maxPages)
+	queryStartTime := lifeEventStartTime(fromTime)
+	batch, err := c.lifeBehaviorEventsOnce(ctx, fromID, fromTime, maxPages)
 	if err == nil {
+		batch.Source = "android"
 		return batch, nil
 	}
-	recentBatch, recentErr := c.lifeRecentEventsOnce(ctx, fromID, lifeEventStartTime(fromTime), maxPages)
+	recentBatch, recentErr := c.lifeRecentEventsOnce(ctx, fromID, fromTime, queryStartTime, maxPages)
 	if recentErr == nil {
+		recentBatch.Source = "recent"
 		return recentBatch, nil
 	}
 	return LifeEventBatch{}, fmt.Errorf("115 Android 操作事件失败：%v；Recent 操作事件也失败：%w", err, recentErr)
@@ -518,7 +571,7 @@ func advanceLifeEventBatchCursor(batch LifeEventBatch, event LifeEvent) LifeEven
 	return batch
 }
 
-func (c *Client) lifeBehaviorEventsOnce(ctx context.Context, fromID, fromTime int64, maxPages int) (LifeEventBatch, error) {
+func (c *Client) lifeBehaviorEventsOnce(ctx context.Context, fromID, cursorTime int64, maxPages int) (LifeEventBatch, error) {
 	if maxPages <= 0 {
 		maxPages = 20
 	}
@@ -541,7 +594,7 @@ func (c *Client) lifeBehaviorEventsOnce(ctx context.Context, fromID, fromTime in
 			if event.ID == 0 && event.UpdateTime == 0 {
 				continue
 			}
-			if lifeEventBeforeCursor(event, fromID, fromTime) {
+			if lifeEventBeforeCursor(event, fromID, cursorTime) {
 				stop = true
 				break
 			}
@@ -568,7 +621,7 @@ func (c *Client) lifeBehaviorEventsOnce(ctx context.Context, fromID, fromTime in
 	return batch, nil
 }
 
-func (c *Client) lifeRecentEventsOnce(ctx context.Context, fromID, fromTime int64, maxPages int) (LifeEventBatch, error) {
+func (c *Client) lifeRecentEventsOnce(ctx context.Context, fromID, cursorTime, queryStartTime int64, maxPages int) (LifeEventBatch, error) {
 	if maxPages <= 0 {
 		maxPages = 20
 	}
@@ -579,7 +632,7 @@ func (c *Client) lifeRecentEventsOnce(ctx context.Context, fromID, fromTime int6
 	offset := 0
 	lastData := ""
 	for page := 0; page < maxPages; page++ {
-		payload, err := c.lifeRecentOperations(ctx, limit, offset, fromTime, lastData)
+		payload, err := c.lifeRecentOperations(ctx, limit, offset, queryStartTime, lastData)
 		if err != nil {
 			return LifeEventBatch{}, err
 		}
@@ -601,7 +654,7 @@ func (c *Client) lifeRecentEventsOnce(ctx context.Context, fromID, fromTime int6
 				if event.ID == 0 && event.UpdateTime == 0 {
 					continue
 				}
-				if lifeEventBeforeCursor(event, fromID, fromTime) {
+				if lifeEventBeforeCursor(event, fromID, cursorTime) {
 					stop = true
 					break
 				}
@@ -749,23 +802,60 @@ func (c *Client) lifeEventsFromRecentOperation(ctx context.Context, row map[stri
 }
 
 func (c *Client) exportTreeByWeb(ctx context.Context, lib LibraryConfig) ([]TreeItem, error) {
-	form := url.Values{}
-	form.Set("file_ids", lib.CID)
-	form.Set("target", "U_0_0")
-	if lib.LayerLimit > 0 {
-		form.Set("layer_limit", strconv.Itoa(lib.LayerLimit))
-	}
-	resp, _, err := c.requestJSONWithRateLimitRetry(ctx, http.MethodPost, "https://webapi.115.com/files/export_dir", form, false, "", "创建目录树导出任务")
+	data, err := c.createExportTreeTask(ctx, lib, lib.LayerLimit, "创建目录树导出任务")
 	if err != nil {
 		return nil, err
 	}
-	data := asMap(resp["data"])
 	exportID := firstString(data, "export_id", "id")
 	if exportID == "" {
 		return nil, errors.New("115 未返回目录树导出任务 ID")
 	}
+	result, err := c.waitExportTreeResult(ctx, exportID, exportTreePollTimeout)
+	if err != nil {
+		return nil, err
+	}
+	pickcode := firstString(result, "pick_code", "pickcode", "pc")
+	if pickcode == "" {
+		return nil, errors.New("115 目录树导出结果缺少 pickcode")
+	}
+	body, err := c.downloadExportTreeWithRetry(ctx, pickcode, defaultUserAgent)
+	if err != nil {
+		return nil, err
+	}
+	if fileID := firstString(result, "file_id", "fid", "id"); fileID != "" {
+		_ = c.deleteWeb(ctx, fileID)
+	}
+	items, err := parseExportTree(body)
+	if err != nil {
+		return nil, err
+	}
+	return stripExportRootDirectory(items), nil
+}
+
+func (c *Client) createExportTreeTask(ctx context.Context, lib LibraryConfig, layerLimit int, action string) (map[string]any, error) {
+	form := url.Values{}
+	form.Set("file_ids", lib.CID)
+	form.Set("target", "U_0_0")
+	if layerLimit > 0 {
+		form.Set("layer_limit", strconv.Itoa(layerLimit))
+	}
+	resp, _, err := c.requestJSONWithRateLimitRetry(ctx, http.MethodPost, "https://webapi.115.com/files/export_dir", form, false, "", action)
+	if err != nil {
+		return nil, err
+	}
+	if err := payloadError(resp); err != nil {
+		return nil, err
+	}
+	data := asMap(resp["data"])
+	if len(data) == 0 {
+		data = resp
+	}
+	return data, nil
+}
+
+func (c *Client) waitExportTreeResult(ctx context.Context, exportID string, timeout time.Duration) (map[string]any, error) {
 	var result map[string]any
-	deadline := time.Now().Add(10 * time.Minute)
+	deadline := time.Now().Add(timeout)
 	for {
 		query := url.Values{}
 		query.Set("export_id", exportID)
@@ -773,35 +863,58 @@ func (c *Client) exportTreeByWeb(ctx context.Context, lib LibraryConfig) ([]Tree
 		if err != nil {
 			return nil, err
 		}
+		if err := payloadError(payload); err != nil {
+			return nil, err
+		}
 		if data := asMap(payload["data"]); len(data) > 0 {
 			result = data
 			break
 		}
 		if time.Now().After(deadline) {
+			if timeout == exportTreeCheckTimeout {
+				return nil, errExportTreePending
+			}
 			return nil, errors.New("115 目录树导出超时")
 		}
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(5 * time.Second):
+		case <-time.After(exportTreePollInterval):
 		}
 	}
-	pickcode := firstString(result, "pick_code", "pickcode", "pc")
-	if pickcode == "" {
-		return nil, errors.New("115 目录树导出结果缺少 pickcode")
+	return result, nil
+}
+
+func (c *Client) downloadExportTreeWithRetry(ctx context.Context, pickcode, userAgentValue string) ([]byte, error) {
+	var lastErr error
+	for attempt := 0; attempt < exportTreeDownloadTries; attempt++ {
+		downloadURL, err := c.directURLAnyWithRateLimitRetry(ctx, pickcode, userAgentValue, "获取目录树下载直链")
+		if err != nil {
+			lastErr = err
+			if !isRetryableExportTreeDownloadError(err) {
+				return nil, err
+			}
+			if waitErr := sleepAfterExportTreeDownload(ctx, attempt); waitErr != nil {
+				return nil, fmt.Errorf("获取目录树下载直链失败：%w", lastErr)
+			}
+			continue
+		}
+		body, err := c.downloadWithRateLimitRetry(ctx, downloadURL, userAgentValue)
+		if err == nil {
+			return body, nil
+		}
+		lastErr = err
+		if !isRetryableExportTreeDownloadError(err) {
+			return nil, err
+		}
+		if waitErr := sleepAfterExportTreeDownload(ctx, attempt); waitErr != nil {
+			return nil, fmt.Errorf("下载目录树失败：%w", lastErr)
+		}
 	}
-	downloadURL, err := c.directURLWebWithRateLimitRetry(ctx, pickcode, defaultUserAgent)
-	if err != nil {
-		return nil, err
+	if lastErr == nil {
+		lastErr = errors.New("未知错误")
 	}
-	body, err := c.downloadWithRateLimitRetry(ctx, downloadURL, defaultUserAgent)
-	if err != nil {
-		return nil, err
-	}
-	if fileID := firstString(result, "file_id", "fid", "id"); fileID != "" {
-		_ = c.deleteWeb(ctx, fileID)
-	}
-	return parseExportTree(body)
+	return nil, fmt.Errorf("115 下载目录树失败，多次重试后仍失败：%w", lastErr)
 }
 
 func (c *Client) exportTreeByCookieList(ctx context.Context, lib LibraryConfig) ([]TreeItem, error) {
@@ -811,6 +924,12 @@ func (c *Client) exportTreeByCookieList(ctx context.Context, lib LibraryConfig) 
 func (c *Client) exportTreeByListWith(ctx context.Context, lib LibraryConfig, list func(context.Context, string) ([]FileInfo, error)) ([]TreeItem, error) {
 	items := make([]TreeItem, 0)
 	err := c.walk(ctx, lib.CID, "", 0, lib.LayerLimit, list, &items)
+	return items, err
+}
+
+func (c *Client) scanSubtreeByListWith(ctx context.Context, lib LibraryConfig, cid, prefix string, depth int, list func(context.Context, string) ([]FileInfo, error)) ([]TreeItem, error) {
+	items := make([]TreeItem, 0)
+	err := c.walk(ctx, cid, prefix, depth, lib.LayerLimit, list, &items)
 	return items, err
 }
 
@@ -1124,6 +1243,21 @@ func (c *Client) directURLWebWithRateLimitRetry(ctx context.Context, pickcode, u
 	return "", fmt.Errorf("获取目录树下载直链被 115 限流，请暂停一段时间后再试：%w", lastErr)
 }
 
+func (c *Client) directURLAnyWithRateLimitRetry(ctx context.Context, pickcode, userAgentValue, action string) (string, error) {
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		value, err := c.DirectURL(ctx, pickcode, userAgentValue)
+		if !isRateLimitError(err) {
+			return value, err
+		}
+		lastErr = err
+		if waitErr := sleepAfterRateLimit(ctx, attempt); waitErr != nil {
+			return "", fmt.Errorf("%s被 115 限流：%w", action, lastErr)
+		}
+	}
+	return "", fmt.Errorf("%s被 115 限流，请暂停一段时间后再试：%w", action, lastErr)
+}
+
 func (c *Client) downloadWithRateLimitRetry(ctx context.Context, rawURL, userAgentValue string) ([]byte, error) {
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
@@ -1137,6 +1271,40 @@ func (c *Client) downloadWithRateLimitRetry(ctx context.Context, rawURL, userAge
 		}
 	}
 	return nil, fmt.Errorf("下载目录树被 115 限流，请暂停一段时间后再试：%w", lastErr)
+}
+
+func isRetryableExportTreeDownloadError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isRateLimitError(err) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	for _, token := range []string{
+		"http 401", "http 403", "http 408", "http 425", "http 429", "http 500", "http 502", "http 503", "http 504",
+		"context deadline exceeded", "timeout", "connection reset", "connection refused", "unexpected eof", "temporary",
+	} {
+		if strings.Contains(message, token) {
+			return true
+		}
+	}
+	return false
+}
+
+func sleepAfterExportTreeDownload(ctx context.Context, attempt int) error {
+	wait := time.Duration(5+attempt*10) * time.Second
+	if wait > exportTreeDownloadMaxLag {
+		wait = exportTreeDownloadMaxLag
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (c *Client) deleteWeb(ctx context.Context, fileID string) error {
@@ -1154,8 +1322,11 @@ func parseExportTree(data []byte) ([]TreeItem, error) {
 	}
 	text := strings.ReplaceAll(string(decoded), "\r\n", "\n")
 	lines := strings.Split(text, "\n")
-	stack := map[int]string{}
-	items := make([]TreeItem, 0)
+	type parsedLine struct {
+		Name  string
+		Depth int
+	}
+	parsed := make([]parsedLine, 0, len(lines))
 	for _, line := range lines {
 		line = strings.TrimRight(line, "\r")
 		if strings.TrimSpace(line) == "" {
@@ -1169,7 +1340,16 @@ func parseExportTree(data []byte) ([]TreeItem, error) {
 		if name == "" {
 			continue
 		}
-		depth := strings.Count(line[:idx], "|") + 1
+		parsed = append(parsed, parsedLine{
+			Name:  name,
+			Depth: strings.Count(line[:idx], "|") + 1,
+		})
+	}
+	stack := map[int]string{}
+	items := make([]TreeItem, 0, len(parsed))
+	for index, line := range parsed {
+		name := line.Name
+		depth := line.Depth
 		stack[depth] = name
 		for key := range stack {
 			if key > depth {
@@ -1183,16 +1363,57 @@ func parseExportTree(data []byte) ([]TreeItem, error) {
 			}
 		}
 		rel := path.Join(parts...)
-		ext := strings.TrimPrefix(strings.ToLower(path.Ext(name)), ".")
+		hasChild := index+1 < len(parsed) && parsed[index+1].Depth > depth
 		items = append(items, TreeItem{
 			RelativePath:   rel,
 			Name:           name,
 			Depth:          depth,
-			IsDirectory:    ext == "",
+			IsDirectory:    hasChild,
 			SourceTreeHash: sourceHash("", rel, "", "", "", 0),
 		})
 	}
 	return items, nil
+}
+
+func stripExportRootDirectory(items []TreeItem) []TreeItem {
+	if len(items) == 0 {
+		return items
+	}
+	root := ""
+	hasRootNode := false
+	for _, item := range items {
+		parts := splitRelativePath(item.RelativePath)
+		if len(parts) == 0 {
+			continue
+		}
+		if root == "" {
+			root = parts[0]
+		} else if root != parts[0] {
+			return items
+		}
+		if len(parts) == 1 && item.IsDirectory {
+			hasRootNode = true
+		}
+	}
+	if root == "" || !hasRootNode {
+		return items
+	}
+	stripped := make([]TreeItem, 0, len(items)-1)
+	prefix := root + "/"
+	for _, item := range items {
+		if item.RelativePath == root {
+			continue
+		}
+		if !strings.HasPrefix(item.RelativePath, prefix) {
+			return items
+		}
+		item.RelativePath = strings.TrimPrefix(item.RelativePath, prefix)
+		if item.Depth > 0 {
+			item.Depth--
+		}
+		stripped = append(stripped, item)
+	}
+	return stripped
 }
 
 func splitRelativePath(value string) []string {

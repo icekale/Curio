@@ -109,6 +109,43 @@ func (c *Client) RefreshTVShow(ctx context.Context, showID int) (models.TVShowMe
 	return tvShowMetadataFromDetail(detail), episodes, err
 }
 
+func (c *Client) ResolveMovie(ctx context.Context, imdbID string, titles []string, year int) (models.MovieMetadata, bool, error) {
+	apiKey, _ := c.current()
+	if apiKey == "" {
+		return models.MovieMetadata{}, false, Error{Code: models.ErrScrapeRequestFailed, Message: "未配置 TMDB API Key"}
+	}
+	if strings.TrimSpace(imdbID) != "" {
+		detail, ok, err := c.movieDetailFromIMDb(ctx, imdbID)
+		if err != nil {
+			return models.MovieMetadata{}, false, err
+		}
+		if ok {
+			return movieMetadataFromDetail(detail), true, nil
+		}
+	}
+	titles = uniqueStrings(titles)
+	if len(titles) == 0 {
+		return models.MovieMetadata{}, false, nil
+	}
+	search, err := c.searchMovies(ctx, titles, year)
+	if err != nil {
+		return models.MovieMetadata{}, false, err
+	}
+	if len(search.Results) == 0 {
+		return models.MovieMetadata{}, false, nil
+	}
+	parsed := parser.Result{Title: titles[0], SearchTitles: titles, Year: year}
+	candidate, ok, ambiguous := bestMovieCandidate(search.Results, parsed)
+	if !ok || ambiguous {
+		return models.MovieMetadata{}, false, nil
+	}
+	detail, err := c.localizedMovieDetail(ctx, candidate.ID)
+	if err != nil {
+		return models.MovieMetadata{}, false, err
+	}
+	return movieMetadataFromDetail(detail), true, nil
+}
+
 func (c *Client) scrapeMovie(ctx context.Context, parsed parser.Result) (Result, error) {
 	if parsed.TMDBID > 0 {
 		detail, err := c.localizedMovieDetail(ctx, parsed.TMDBID)
@@ -116,6 +153,15 @@ func (c *Client) scrapeMovie(ctx context.Context, parsed parser.Result) (Result,
 			return Result{}, Error{Code: models.ErrScrapeRequestFailed, Message: err.Error()}
 		}
 		return c.movieResultFromDetail(ctx, detail)
+	}
+	if parsed.IMDbID != "" {
+		detail, ok, err := c.movieDetailFromIMDb(ctx, parsed.IMDbID)
+		if err != nil {
+			return Result{}, Error{Code: models.ErrScrapeRequestFailed, Message: err.Error()}
+		}
+		if ok {
+			return c.movieResultFromDetail(ctx, detail)
+		}
 	}
 	search, err := c.searchMovies(ctx, parsed.SearchTitles, parsed.Year)
 	if err != nil {
@@ -139,7 +185,23 @@ func (c *Client) scrapeMovie(ctx context.Context, parsed parser.Result) (Result,
 }
 
 func (c *Client) movieResultFromDetail(ctx context.Context, detail tmdbMovieDetail) (Result, error) {
-	movie := models.MovieMetadata{
+	movie := movieMetadataFromDetail(detail)
+	result := Result{MediaType: models.MediaMovie, Movie: movie}
+	if detail.BelongsToCollection != nil {
+		collection, err := c.collectionDetail(ctx, detail.BelongsToCollection.ID)
+		if err != nil {
+			return Result{}, Error{Code: models.ErrCollectionFetchFailed, Message: err.Error()}
+		}
+		movie.CollectionID = collection.TMDBID
+		result.MediaType = models.MediaCollectionMovie
+		result.Movie = movie
+		result.Collection = &collection
+	}
+	return result, nil
+}
+
+func movieMetadataFromDetail(detail tmdbMovieDetail) models.MovieMetadata {
+	return models.MovieMetadata{
 		TMDBID:              detail.ID,
 		IMDBID:              detail.IMDBID,
 		Title:               detail.Title,
@@ -157,18 +219,6 @@ func (c *Client) movieResultFromDetail(ctx context.Context, detail tmdbMovieDeta
 		PosterPath:          detail.PosterPath,
 		BackdropPath:        detail.BackdropPath,
 	}
-	result := Result{MediaType: models.MediaMovie, Movie: movie}
-	if detail.BelongsToCollection != nil {
-		collection, err := c.collectionDetail(ctx, detail.BelongsToCollection.ID)
-		if err != nil {
-			return Result{}, Error{Code: models.ErrCollectionFetchFailed, Message: err.Error()}
-		}
-		movie.CollectionID = collection.TMDBID
-		result.MediaType = models.MediaCollectionMovie
-		result.Movie = movie
-		result.Collection = &collection
-	}
-	return result, nil
 }
 
 func (c *Client) scrapeTV(ctx context.Context, parsed parser.Result) (Result, error) {
@@ -179,7 +229,16 @@ func (c *Client) scrapeTV(ctx context.Context, parsed parser.Result) (Result, er
 		if err != nil {
 			return Result{}, Error{Code: models.ErrScrapeRequestFailed, Message: err.Error()}
 		}
-	} else {
+	} else if parsed.IMDbID != "" {
+		detail, ok, err := c.tvDetailFromIMDb(ctx, parsed.IMDbID)
+		if err != nil {
+			return Result{}, Error{Code: models.ErrScrapeRequestFailed, Message: err.Error()}
+		}
+		if ok {
+			showDetail = detail
+		}
+	}
+	if showDetail.ID == 0 {
 		search, err := c.searchTV(ctx, parsed.SearchTitles)
 		if err != nil {
 			return Result{}, Error{Code: models.ErrScrapeRequestFailed, Message: err.Error()}
@@ -200,6 +259,19 @@ func (c *Client) scrapeTV(ctx context.Context, parsed parser.Result) (Result, er
 			return Result{}, Error{Code: models.ErrScrapeRequestFailed, Message: detailErr.Error()}
 		}
 	}
+	show := tvShowMetadataFromDetail(showDetail)
+	if parsed.AirDate != "" && (parsed.Season == 0 || parsed.Episode == 0) {
+		episodes, err := c.localizedTVShowEpisodes(ctx, showDetail)
+		if err != nil {
+			return Result{}, Error{Code: models.ErrScrapeRequestFailed, Message: err.Error()}
+		}
+		episode, ok := episodeByAirDate(episodes, parsed.AirDate)
+		if !ok {
+			return Result{}, Error{Code: models.ErrTVEpisodeNotFound, Message: "未找到匹配播出日期的剧集"}
+		}
+		episodes = ensureTVEpisode(episodes, episode)
+		return Result{MediaType: models.MediaTVEpisode, TVShow: show, TVEpisode: episode, TVEpisodes: episodes}, nil
+	}
 	episodeDetail, err := c.localizedTVEpisodeDetail(ctx, showDetail.ID, parsed.Season, parsed.Episode)
 	if err != nil {
 		if !strings.Contains(err.Error(), "TMDB 返回状态码 404") {
@@ -207,7 +279,6 @@ func (c *Client) scrapeTV(ctx context.Context, parsed parser.Result) (Result, er
 		}
 		episodeDetail = tmdbTVEpisodeDetail{Name: fmt.Sprintf("第%02d集", parsed.Episode)}
 	}
-	show := tvShowMetadataFromDetail(showDetail)
 	episode := models.TVEpisodeMetadata{
 		ID:         fmt.Sprintf("%d:S%02dE%02d", showDetail.ID, parsed.Season, parsed.Episode),
 		ShowTMDBID: showDetail.ID,
@@ -298,6 +369,48 @@ func (c *Client) searchTV(ctx context.Context, titles []string) (tmdbTVSearch, e
 		return merged, lastErr
 	}
 	return merged, nil
+}
+
+func (c *Client) findByIMDb(ctx context.Context, imdbID string) (tmdbFindResult, error) {
+	var response tmdbFindResult
+	imdbID = strings.ToLower(strings.TrimSpace(imdbID))
+	if imdbID == "" {
+		return response, nil
+	}
+	key := fmt.Sprintf("cache:tmdb:find:%s", imdbID)
+	path := "/find/" + url.PathEscape(imdbID)
+	err := c.cached(ctx, key, path, map[string]string{"external_source": "imdb_id", "language": "en-US"}, &response)
+	return response, err
+}
+
+func (c *Client) movieDetailFromIMDb(ctx context.Context, imdbID string) (tmdbMovieDetail, bool, error) {
+	find, err := c.findByIMDb(ctx, imdbID)
+	if err != nil {
+		return tmdbMovieDetail{}, false, err
+	}
+	if len(find.MovieResults) == 0 {
+		return tmdbMovieDetail{}, false, nil
+	}
+	detail, err := c.localizedMovieDetail(ctx, find.MovieResults[0].ID)
+	if err != nil {
+		return tmdbMovieDetail{}, false, err
+	}
+	return detail, true, nil
+}
+
+func (c *Client) tvDetailFromIMDb(ctx context.Context, imdbID string) (tmdbTVDetail, bool, error) {
+	find, err := c.findByIMDb(ctx, imdbID)
+	if err != nil {
+		return tmdbTVDetail{}, false, err
+	}
+	if len(find.TVResults) == 0 {
+		return tmdbTVDetail{}, false, nil
+	}
+	detail, err := c.localizedTVDetail(ctx, find.TVResults[0].ID)
+	if err != nil {
+		return tmdbTVDetail{}, false, err
+	}
+	return detail, true, nil
 }
 
 func (c *Client) movieDetail(ctx context.Context, id int, language string) (tmdbMovieDetail, error) {
@@ -483,6 +596,20 @@ func ensureTVEpisode(episodes []models.TVEpisodeMetadata, target models.TVEpisod
 		}
 	}
 	return append(episodes, target)
+}
+
+func episodeByAirDate(episodes []models.TVEpisodeMetadata, airDate string) (models.TVEpisodeMetadata, bool) {
+	airDate = strings.TrimSpace(airDate)
+	for _, episode := range episodes {
+		if strings.TrimSpace(episode.AirDate) != airDate {
+			continue
+		}
+		if episode.ID == "" {
+			episode.ID = fmt.Sprintf("%d:S%02dE%02d", episode.ShowTMDBID, episode.Season, episode.Episode)
+		}
+		return episode, true
+	}
+	return models.TVEpisodeMetadata{}, false
 }
 
 func mergeTVEpisode(value, fallback models.TVEpisodeMetadata) models.TVEpisodeMetadata {
@@ -1117,6 +1244,24 @@ func certification(results []tmdbReleaseDateResult) string {
 	return ""
 }
 
+func uniqueStrings(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := map[string]struct{}{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		key := strings.ToLower(value)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, value)
+	}
+	return out
+}
+
 type tmdbMovieSearch struct {
 	Results []tmdbMovieSearchItem `json:"results"`
 }
@@ -1135,6 +1280,11 @@ type tmdbMovieSearchItem struct {
 
 type tmdbTVSearch struct {
 	Results []tmdbTVSearchItem `json:"results"`
+}
+
+type tmdbFindResult struct {
+	MovieResults []tmdbMovieSearchItem `json:"movie_results"`
+	TVResults    []tmdbTVSearchItem    `json:"tv_results"`
 }
 
 type tmdbTVSearchItem struct {

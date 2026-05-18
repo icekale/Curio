@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
@@ -21,12 +22,12 @@ import (
 const (
 	Unknown      = "Unknown"
 	isoHeaderMax = int64(16 * 1024 * 1024)
-	isoSampleMax = int64(16 * 1024 * 1024)
+	isoSampleMax = int64(64 * 1024 * 1024)
 )
 
 var (
 	ffprobeSlots  = make(chan struct{}, 2)
-	isoSampleStep = []int64{2 * 1024 * 1024, 4 * 1024 * 1024, 8 * 1024 * 1024, isoSampleMax}
+	isoSampleStep = []int64{8 * 1024 * 1024, 16 * 1024 * 1024, 32 * 1024 * 1024, isoSampleMax}
 )
 
 type Info struct {
@@ -35,6 +36,37 @@ type Info struct {
 	AudioCodec    string
 	AudioChannels string
 	HDRFormat     string
+}
+
+type DetailedInfo struct {
+	Info          Info
+	Streams       []Stream
+	DurationTicks int64
+}
+
+type Stream struct {
+	Index            int
+	Type             string
+	Codec            string
+	CodecTag         string
+	Profile          string
+	Width            int
+	Height           int
+	CodedWidth       int
+	CodedHeight      int
+	Channels         int
+	ChannelLayout    string
+	SampleRate       int
+	BitRate          int64
+	AverageFrameRate string
+	RealFrameRate    string
+	Language         string
+	Title            string
+	Default          bool
+	Forced           bool
+	HearingImpaired  bool
+	TextSubtitle     bool
+	VideoRange       string
 }
 
 type ProbeStats struct {
@@ -60,11 +92,14 @@ type Source struct {
 
 type probeOutput struct {
 	Streams []probeStream `json:"streams"`
+	Format  probeFormat   `json:"format"`
 }
 
 type probeStream struct {
+	Index          int               `json:"index"`
 	CodecType      string            `json:"codec_type"`
 	CodecName      string            `json:"codec_name"`
+	CodecTag       string            `json:"codec_tag_string"`
 	Profile        string            `json:"profile"`
 	Width          int               `json:"width"`
 	Height         int               `json:"height"`
@@ -72,6 +107,11 @@ type probeStream struct {
 	CodedHeight    int               `json:"coded_height"`
 	Channels       int               `json:"channels"`
 	ChannelLayout  string            `json:"channel_layout"`
+	SampleRate     string            `json:"sample_rate"`
+	BitRate        string            `json:"bit_rate"`
+	Duration       string            `json:"duration"`
+	AvgFrameRate   string            `json:"avg_frame_rate"`
+	RFrameRate     string            `json:"r_frame_rate"`
 	ColorTransfer  string            `json:"color_transfer"`
 	ColorPrimaries string            `json:"color_primaries"`
 	ColorSpace     string            `json:"color_space"`
@@ -79,6 +119,10 @@ type probeStream struct {
 	Disposition    map[string]int    `json:"disposition"`
 	Tags           map[string]string `json:"tags"`
 	SideDataList   []map[string]any  `json:"side_data_list"`
+}
+
+type probeFormat struct {
+	Duration string `json:"duration"`
 }
 
 func UnknownInfo() Info {
@@ -97,29 +141,49 @@ func Probe(ctx context.Context, source Source) (Info, error) {
 }
 
 func ProbeWithStats(ctx context.Context, source Source) (Info, ProbeStats, error) {
+	detailed, stats, err := ProbeDetailedWithStats(ctx, source)
+	return detailed.Info, stats, err
+}
+
+func ProbeDetailed(ctx context.Context, source Source) (DetailedInfo, error) {
+	info, _, err := ProbeDetailedWithStats(ctx, source)
+	return info, err
+}
+
+func ProbeDetailedWithStats(ctx context.Context, source Source) (DetailedInfo, ProbeStats, error) {
 	var stats ProbeStats
 	start := time.Now()
-	info, err := probe(ctx, source, &stats)
+	info, err := probeDetailed(ctx, source, &stats)
 	stats.Total = time.Since(start)
 	return info, stats, err
 }
 
 func probe(ctx context.Context, source Source, stats *ProbeStats) (Info, error) {
+	detailed, err := probeDetailed(ctx, source, stats)
+	return detailed.Info, err
+}
+
+func probeDetailed(ctx context.Context, source Source, stats *ProbeStats) (DetailedInfo, error) {
 	if strings.EqualFold(strings.TrimPrefix(source.Extension, "."), "iso") {
-		return probeISO(ctx, source, stats)
+		return probeISODetailed(ctx, source, stats)
 	}
 	input, cleanup, err := probeInput(ctx, source)
 	if err != nil {
-		return UnknownInfo(), err
+		return DetailedInfo{Info: UnknownInfo()}, err
 	}
 	defer cleanup()
-	return probeFF(ctx, input, source.Headers, source.UserAgent, stats)
+	return probeFFDetailed(ctx, input, source.Headers, source.UserAgent, stats)
 }
 
 func probeISO(ctx context.Context, source Source, stats *ProbeStats) (Info, error) {
+	detailed, err := probeISODetailed(ctx, source, stats)
+	return detailed.Info, err
+}
+
+func probeISODetailed(ctx context.Context, source Source, stats *ProbeStats) (DetailedInfo, error) {
 	reader, cleanup, err := isoReader(ctx, source, stats)
 	if err != nil {
-		return UnknownInfo(), err
+		return DetailedInfo{Info: UnknownInfo()}, err
 	}
 	defer cleanup()
 	if strings.TrimSpace(source.URL) != "" {
@@ -141,20 +205,20 @@ func probeISO(ctx context.Context, source Source, stats *ProbeStats) (Info, erro
 		stats.ISOParse += time.Since(parseStart)
 	}
 	if err != nil {
-		return UnknownInfo(), err
+		return DetailedInfo{Info: UnknownInfo()}, err
 	}
 	if len(stream.extents) == 0 {
-		return UnknownInfo(), fmt.Errorf("ISO 内未找到可采样的主媒体流：%s", stream.path)
+		return DetailedInfo{Info: UnknownInfo()}, fmt.Errorf("ISO 内未找到可采样的主媒体流：%s", stream.path)
 	}
 	temp, err := os.CreateTemp("", "curio-iso-*.m2ts")
 	if err != nil {
-		return UnknownInfo(), err
+		return DetailedInfo{Info: UnknownInfo()}, err
 	}
 	defer func() {
 		_ = temp.Close()
 		_ = os.Remove(temp.Name())
 	}()
-	var lastInfo Info
+	var lastInfo DetailedInfo
 	var lastErr error
 	var currentSize int64
 	for _, sampleLimit := range isoSampleStep {
@@ -165,32 +229,30 @@ func probeISO(ctx context.Context, source Source, stats *ProbeStats) (Info, erro
 			stats.ISOSampleBytes = currentSize
 		}
 		if err != nil {
-			return UnknownInfo(), err
+			return DetailedInfo{Info: UnknownInfo()}, err
 		}
 		if info, err := temp.Stat(); err != nil || info.Size() < min64(sampleLimit, 2*1024*1024) {
 			if err != nil {
-				return UnknownInfo(), err
+				return DetailedInfo{Info: UnknownInfo()}, err
 			}
-			return UnknownInfo(), errors.New("ISO 主媒体流采样不足 2MB")
+			return DetailedInfo{Info: UnknownInfo()}, errors.New("ISO 主媒体流采样不足 2MB")
 		}
 		if err := temp.Sync(); err != nil {
-			return UnknownInfo(), err
+			return DetailedInfo{Info: UnknownInfo()}, err
 		}
 		if stats != nil {
 			stats.ISOAttempts++
 		}
-		info, probeErr := probeFF(ctx, temp.Name(), nil, "", stats)
+		info, probeErr := probeFFDetailed(ctx, temp.Name(), nil, "", stats)
 		if probeErr == nil {
 			lastInfo = info
-			if complete(info) {
-				return info, nil
-			}
 		}
 		lastErr = probeErr
 	}
 	if lastErr != nil {
-		return UnknownInfo(), lastErr
+		return DetailedInfo{Info: UnknownInfo()}, lastErr
 	}
+	lastInfo.DurationTicks = 0
 	return lastInfo, nil
 }
 
@@ -205,18 +267,23 @@ func probeInput(ctx context.Context, source Source) (string, func(), error) {
 }
 
 func probeFF(ctx context.Context, input string, headers map[string]string, userAgent string, stats *ProbeStats) (Info, error) {
+	detailed, err := probeFFDetailed(ctx, input, headers, userAgent, stats)
+	return detailed.Info, err
+}
+
+func probeFFDetailed(ctx context.Context, input string, headers map[string]string, userAgent string, stats *ProbeStats) (DetailedInfo, error) {
 	select {
 	case ffprobeSlots <- struct{}{}:
 		defer func() { <-ffprobeSlots }()
 	case <-ctx.Done():
-		return UnknownInfo(), ctx.Err()
+		return DetailedInfo{Info: UnknownInfo()}, ctx.Err()
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
 	args := []string{
 		"-v", "error",
-		"-probesize", "2M",
-		"-analyzeduration", "2M",
+		"-probesize", "64M",
+		"-analyzeduration", "10M",
 	}
 	if strings.HasPrefix(strings.ToLower(input), "http://") || strings.HasPrefix(strings.ToLower(input), "https://") {
 		args = append(args, "-rw_timeout", "30000000")
@@ -227,7 +294,7 @@ func probeFF(ctx context.Context, input string, headers map[string]string, userA
 			args = append(args, "-headers", httpHeaderBlock(headers))
 		}
 	}
-	args = append(args, "-show_streams", "-of", "json", input)
+	args = append(args, "-show_streams", "-show_format", "-of", "json", input)
 	cmd := exec.CommandContext(probeCtx, "ffprobe", args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -241,16 +308,45 @@ func probeFF(ctx context.Context, input string, headers map[string]string, userA
 		if message == "" {
 			message = err.Error()
 		}
-		return UnknownInfo(), fmt.Errorf("ffprobe 读取失败：%s", message)
+		return DetailedInfo{Info: UnknownInfo()}, fmt.Errorf("ffprobe 读取失败：%s", message)
 	}
 	if stats != nil {
 		stats.FFProbe += time.Since(probeStart)
 	}
 	var output probeOutput
 	if err := json.Unmarshal(stdout.Bytes(), &output); err != nil {
-		return UnknownInfo(), err
+		return DetailedInfo{Info: UnknownInfo()}, err
 	}
-	return normalize(output), nil
+	return normalizeDetailed(output), nil
+}
+
+func normalizeDetailed(output probeOutput) DetailedInfo {
+	return DetailedInfo{
+		Info:          normalize(output),
+		Streams:       streamDetails(output.Streams),
+		DurationTicks: durationTicks(output),
+	}
+}
+
+func durationTicks(output probeOutput) int64 {
+	seconds := durationSeconds(output.Format.Duration)
+	for _, stream := range output.Streams {
+		if value := durationSeconds(stream.Duration); value > seconds {
+			seconds = value
+		}
+	}
+	if seconds <= 0 {
+		return 0
+	}
+	return int64(math.Round(seconds * 10000000))
+}
+
+func durationSeconds(value string) float64 {
+	seconds, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+	if err != nil || seconds <= 0 || math.IsNaN(seconds) || math.IsInf(seconds, 0) {
+		return 0
+	}
+	return seconds
 }
 
 func normalize(output probeOutput) Info {
@@ -269,12 +365,45 @@ func normalize(output probeOutput) Info {
 	return info
 }
 
-func complete(info Info) bool {
-	return info.Resolution != Unknown &&
-		info.VideoCodec != Unknown &&
-		info.AudioCodec != Unknown &&
-		info.AudioChannels != Unknown &&
-		info.HDRFormat != Unknown
+func streamDetails(streams []probeStream) []Stream {
+	out := make([]Stream, 0, len(streams))
+	for _, stream := range streams {
+		switch stream.CodecType {
+		case "video", "audio", "subtitle":
+		default:
+			continue
+		}
+		detail := Stream{
+			Index:            stream.Index,
+			Type:             stream.CodecType,
+			Codec:            strings.ToLower(strings.TrimSpace(stream.CodecName)),
+			CodecTag:         strings.TrimSpace(stream.CodecTag),
+			Profile:          strings.TrimSpace(stream.Profile),
+			Width:            stream.Width,
+			Height:           stream.Height,
+			CodedWidth:       stream.CodedWidth,
+			CodedHeight:      stream.CodedHeight,
+			Channels:         stream.Channels,
+			ChannelLayout:    strings.TrimSpace(stream.ChannelLayout),
+			SampleRate:       intString(stream.SampleRate),
+			BitRate:          int64String(stream.BitRate),
+			AverageFrameRate: cleanFrameRate(stream.AvgFrameRate),
+			RealFrameRate:    cleanFrameRate(stream.RFrameRate),
+			Language:         streamLanguage(stream.Tags),
+			Title:            streamTitle(stream.Tags),
+			Default:          stream.Disposition["default"] == 1,
+			Forced:           stream.Disposition["forced"] == 1,
+			HearingImpaired:  stream.Disposition["hearing_impaired"] == 1,
+		}
+		if detail.Type == "video" {
+			detail.VideoRange = videoRange(stream)
+		}
+		if detail.Type == "subtitle" {
+			detail.TextSubtitle = textSubtitleCodec(detail.Codec)
+		}
+		out = append(out, detail)
+	}
+	return out
 }
 
 func primaryVideo(streams []probeStream) (probeStream, bool) {
@@ -467,6 +596,75 @@ func hdrFormat(streams []probeStream) string {
 		return "SDR"
 	}
 	return strings.Join(unique(formats), " ")
+}
+
+func videoRange(stream probeStream) string {
+	text := strings.ToLower(strings.Join([]string{
+		stream.Profile,
+		stream.ColorTransfer,
+		stream.ColorPrimaries,
+		stream.ColorSpace,
+		stream.PixFmt,
+		tagText(stream.Tags),
+		sideDataText(stream.SideDataList),
+	}, " "))
+	switch {
+	case hasAny(text, "dovi", "dolby vision", "dv profile", "dvhe", "dvh1"):
+		return "DV"
+	case hasAny(text, "hdr10+", "smpte2094", "dynamic hdr plus"):
+		return "HDR10Plus"
+	case strings.Contains(text, "smpte2084"):
+		return "HDR10"
+	case strings.Contains(text, "arib-std-b67"):
+		return "HLG"
+	default:
+		return "SDR"
+	}
+}
+
+func streamLanguage(tags map[string]string) string {
+	for _, key := range []string{"language", "LANGUAGE"} {
+		if value := strings.TrimSpace(tags[key]); value != "" {
+			return value
+		}
+	}
+	return "und"
+}
+
+func streamTitle(tags map[string]string) string {
+	for _, key := range []string{"title", "TITLE", "handler_name"} {
+		if value := strings.TrimSpace(tags[key]); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func textSubtitleCodec(codec string) bool {
+	switch strings.ToLower(strings.TrimSpace(codec)) {
+	case "subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text":
+		return true
+	default:
+		return false
+	}
+}
+
+func intString(value string) int {
+	parsed, _ := strconv.Atoi(strings.TrimSpace(value))
+	return parsed
+}
+
+func int64String(value string) int64 {
+	parsed, _ := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+	return parsed
+}
+
+func cleanFrameRate(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || value == "0/0" {
+		return ""
+	}
+	return value
 }
 
 func tagText(tags map[string]string) string {

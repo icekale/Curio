@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"curio/internal/models"
 	"curio/internal/parser"
 )
 
@@ -77,5 +78,17 @@ func TestBestTVCandidateUsesSearchQueryFallback(t *testing.T) {
 	}, parsed)
 	if !ok || ambiguous || candidate.ID != 72517 {
 		t.Fatalf("expected Youzitsu query alias match 72517, got candidate=%+v ok=%v ambiguous=%v", candidate, ok, ambiguous)
+	}
+}
+
+func TestEpisodeByAirDate(t *testing.T) {
+	episode, ok := episodeByAirDate([]models.TVEpisodeMetadata{
+		{ShowTMDBID: 42, Season: 29, Episode: 73, Title: "Guest Episode", AirDate: "2024-05-17"},
+	}, "2024-05-17")
+	if !ok {
+		t.Fatal("expected to find episode by air date")
+	}
+	if episode.Season != 29 || episode.Episode != 73 || episode.ID != "42:S29E73" {
+		t.Fatalf("unexpected episode by air date result: %+v", episode)
 	}
 }

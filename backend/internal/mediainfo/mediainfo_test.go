@@ -3,7 +3,7 @@ package mediainfo
 import "testing"
 
 func TestNormalizeProbeOutput(t *testing.T) {
-	info := normalize(probeOutput{Streams: []probeStream{
+	detailed := normalizeDetailed(probeOutput{Format: probeFormat{Duration: "123.456"}, Streams: []probeStream{
 		{
 			CodecType:     "video",
 			CodecName:     "hevc",
@@ -20,8 +20,12 @@ func TestNormalizeProbeOutput(t *testing.T) {
 			Disposition:   map[string]int{"default": 1},
 		},
 	}})
+	info := detailed.Info
 	if info.Resolution != "2160p" || info.VideoCodec != "HEVC" || info.AudioCodec != "TrueHD" || info.AudioChannels != "7.1" || info.HDRFormat != "DV HDR10" {
 		t.Fatalf("unexpected info: %+v", info)
+	}
+	if detailed.DurationTicks != 1234560000 {
+		t.Fatalf("unexpected duration ticks: %d", detailed.DurationTicks)
 	}
 }
 

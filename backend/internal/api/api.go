@@ -12,12 +12,14 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"curio/internal/classifier"
 	"curio/internal/clouddrive"
+	"curio/internal/curated"
 	"curio/internal/embyproxy"
 	"curio/internal/models"
 	"curio/internal/naming"
@@ -38,6 +40,7 @@ type API struct {
 	scraper    *scraper.Client
 	redis      *redis.Client
 	p115       *p115.Service
+	curated    *curated.Service
 	adminToken string
 }
 
@@ -48,6 +51,8 @@ type rearchivePayload struct {
 	Episode       int    `json:"episode"`
 	SeasonOffset  int    `json:"season_offset"`
 	EpisodeOffset int    `json:"episode_offset"`
+	SourcePath    string `json:"source_path"`
+	TargetRoot    string `json:"target_root"`
 }
 
 func (p rearchivePayload) options() worker.RearchiveOptions {
@@ -58,6 +63,8 @@ func (p rearchivePayload) options() worker.RearchiveOptions {
 		Episode:       p.Episode,
 		SeasonOffset:  p.SeasonOffset,
 		EpisodeOffset: p.EpisodeOffset,
+		SourcePath:    p.SourcePath,
+		TargetRoot:    p.TargetRoot,
 	}
 }
 
@@ -67,7 +74,11 @@ func New(store *repository.Store, workerService *worker.Service, scraperClient *
 }
 
 func NewWithP115(store *repository.Store, workerService *worker.Service, scraperClient *scraper.Client, redisClient *redis.Client, p115Service *p115.Service, allowedOrigin, frontendDir, adminToken string) http.Handler {
-	api := &API{store: store, worker: workerService, scraper: scraperClient, redis: redisClient, p115: p115Service, adminToken: strings.TrimSpace(adminToken)}
+	return NewWithServices(store, workerService, scraperClient, redisClient, p115Service, nil, allowedOrigin, frontendDir, adminToken)
+}
+
+func NewWithServices(store *repository.Store, workerService *worker.Service, scraperClient *scraper.Client, redisClient *redis.Client, p115Service *p115.Service, curatedService *curated.Service, allowedOrigin, frontendDir, adminToken string) http.Handler {
+	api := &API{store: store, worker: workerService, scraper: scraperClient, redis: redisClient, p115: p115Service, curated: curatedService, adminToken: strings.TrimSpace(adminToken)}
 	router := chi.NewRouter()
 	router.Use(recoverJSON)
 	router.Use(cors.Handler(cors.Options{
@@ -106,10 +117,12 @@ func NewWithP115(store *repository.Store, workerService *worker.Service, scraper
 	router.Post("/api/p115/auth/refresh", api.refreshP115Token)
 	router.Post("/api/p115/test", api.testP115)
 	router.Post("/api/p115/export-tree", api.exportP115Tree)
+	router.Post("/api/p115/nodes/rebuild", api.rebuildP115Nodes)
 	router.Post("/api/p115/strm/sync", api.syncP115STRM)
 	router.Post("/api/p115/strm/cleanup", api.cleanupP115STRM)
 	router.Get("/api/p115/sync-runs", api.p115SyncRuns)
 	router.Get("/api/p115/playback/logs", api.p115PlaybackLogs)
+	router.Get("/api/logs", api.logs)
 	router.Get("/api/settings/classification", api.classification)
 	router.Put("/api/settings/classification", api.saveClassification)
 	router.Get("/api/settings/templates", api.templates)
@@ -127,7 +140,10 @@ func NewWithP115(store *repository.Store, workerService *worker.Service, scraper
 	router.Get("/api/tv-shows", api.tvShows)
 	router.Get("/api/tv-shows/{showID}", api.tvShow)
 	router.Get("/api/collections", api.collections)
+	router.Post("/api/collections/repair-complete", api.repairCompleteCollections)
 	router.Get("/api/collections/{collectionID}", api.collection)
+	router.Get("/api/curated-collections/{listID}", api.curatedCollection)
+	router.Post("/api/curated-collections/{listID}/refresh", api.refreshCuratedCollection)
 	router.Get("/play/115/*", api.play115)
 	router.Head("/play/115/*", api.play115)
 	router.Mount("/emby", embyproxy.New(store, p115Service))
@@ -369,7 +385,7 @@ func (a *API) systemSettings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, redactSystemSettings(settings))
+	writeJSON(w, http.StatusOK, settings)
 }
 
 func (a *API) saveSystemSettings(w http.ResponseWriter, r *http.Request) {
@@ -382,6 +398,10 @@ func (a *API) saveSystemSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	settings.TMDBAPIKey = strings.TrimSpace(settings.TMDBAPIKey)
 	settings.NetworkProxy = strings.TrimSpace(settings.NetworkProxy)
+	settings.AIBaseURL = strings.TrimRight(strings.TrimSpace(settings.AIBaseURL), "/")
+	settings.AIAPIKey = strings.TrimSpace(settings.AIAPIKey)
+	settings.AIModel = strings.TrimSpace(settings.AIModel)
+	settings.AIFilenamePrompt = strings.TrimSpace(settings.AIFilenamePrompt)
 	current, err := a.store.Settings(ctx)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -400,6 +420,17 @@ func (a *API) saveSystemSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if settings.AIBaseURL != "" {
+		parsed, err := url.Parse(settings.AIBaseURL)
+		if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+			writeError(w, http.StatusBadRequest, "AI 接口地址无效")
+			return
+		}
+		if parsed.Scheme != "http" && parsed.Scheme != "https" {
+			writeError(w, http.StatusBadRequest, "AI 接口地址协议必须是 http 或 https")
+			return
+		}
+	}
 	saved, err := a.store.SaveSettings(ctx, settings)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -409,7 +440,7 @@ func (a *API) saveSystemSettings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, redactSystemSettings(saved))
+	writeJSON(w, http.StatusOK, saved)
 }
 
 func (a *API) cloudDriveSettings(w http.ResponseWriter, r *http.Request) {
@@ -420,7 +451,7 @@ func (a *API) cloudDriveSettings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, redactCloudDriveSettings(settings))
+	writeJSON(w, http.StatusOK, settings)
 }
 
 func (a *API) saveCloudDriveSettings(w http.ResponseWriter, r *http.Request) {
@@ -444,7 +475,7 @@ func (a *API) saveCloudDriveSettings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, redactCloudDriveSettings(saved))
+	writeJSON(w, http.StatusOK, saved)
 }
 
 func (a *API) p115Settings(w http.ResponseWriter, r *http.Request) {
@@ -460,7 +491,7 @@ func (a *API) p115Settings(w http.ResponseWriter, r *http.Request) {
 		settings.EmbyProxyPort = 8097
 	}
 	settings.CookieLoginApp = p115.NormalizeCookieLoginApp(settings.CookieLoginApp)
-	writeJSON(w, http.StatusOK, redactP115Settings(settings))
+	writeJSON(w, http.StatusOK, settings)
 }
 
 func (a *API) saveP115Settings(w http.ResponseWriter, r *http.Request) {
@@ -484,7 +515,7 @@ func (a *API) saveP115Settings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, redactP115Settings(saved))
+	writeJSON(w, http.StatusOK, saved)
 }
 
 func (a *API) startP115QRCode(w http.ResponseWriter, r *http.Request) {
@@ -586,7 +617,7 @@ func (a *API) refreshP115Token(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) testP115(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := contextWithTimeout(r)
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 	status, err := a.p115.Status(ctx)
 	if err != nil {
@@ -597,7 +628,7 @@ func (a *API) testP115(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) exportP115Tree(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Minute)
 	defer cancel()
 	result, err := a.p115.ExportTree(ctx)
 	if err != nil {
@@ -608,7 +639,7 @@ func (a *API) exportP115Tree(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) syncP115STRM(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Minute)
 	defer cancel()
 	result, err := a.p115.Sync(ctx, requestBaseURL(r))
 	if err != nil {
@@ -618,8 +649,19 @@ func (a *API) syncP115STRM(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
+func (a *API) rebuildP115Nodes(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Minute)
+	defer cancel()
+	result, err := a.p115.RebuildNodes(ctx, requestBaseURL(r))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
 func (a *API) cleanupP115STRM(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 	result, err := a.p115.Cleanup(ctx)
 	if err != nil {
@@ -644,6 +686,55 @@ func (a *API) p115SyncRuns(w http.ResponseWriter, r *http.Request) {
 func (a *API) p115PlaybackLogs(w http.ResponseWriter, r *http.Request) {
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	writeJSON(w, http.StatusOK, map[string]any{"items": playdiag.Records(limit)})
+}
+
+func (a *API) logs(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := contextWithTimeout(r)
+	defer cancel()
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	if limit <= 0 {
+		limit = 500
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	logType := strings.TrimSpace(r.URL.Query().Get("type"))
+	if logType == "" {
+		logType = "all"
+	}
+	page, err := a.store.LogEntries(ctx, logType, limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if logType == "all" || logType == "playback" {
+		for index, record := range playdiag.Records(limit) {
+			status := "ok"
+			lower := strings.ToLower(record.Message)
+			if strings.Contains(lower, "failed") || strings.Contains(lower, "err=") || strings.Contains(lower, "error") {
+				status = "failed"
+			}
+			page.Items = append(page.Items, models.LogEntry{
+				ID:        fmt.Sprintf("playback-%d-%d", record.Time.UnixNano(), index),
+				Type:      "playback",
+				Source:    "播放诊断",
+				Status:    status,
+				Message:   record.Message,
+				Detail:    record.Message,
+				CreatedAt: record.Time,
+			})
+		}
+		sort.SliceStable(page.Items, func(i, j int) bool {
+			return page.Items[i].CreatedAt.After(page.Items[j].CreatedAt)
+		})
+		page.Total = len(page.Items)
+		if len(page.Items) > limit {
+			page.Items = page.Items[:limit]
+		}
+	}
+	page.Limit = limit
+	page.Type = logType
+	writeJSON(w, http.StatusOK, page)
 }
 
 func (a *API) play115(w http.ResponseWriter, r *http.Request) {
@@ -957,12 +1048,23 @@ func (a *API) collections(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := contextWithTimeout(r)
 	defer cancel()
 	limit, offset := paginationFromRequest(r)
-	collections, err := a.store.Collections(ctx, strings.TrimSpace(r.URL.Query().Get("q")), limit, offset)
+	collections, err := a.store.Collections(ctx, strings.TrimSpace(r.URL.Query().Get("q")), strings.TrimSpace(r.URL.Query().Get("status")), limit, offset)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, collections)
+}
+
+func (a *API) repairCompleteCollections(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
+	defer cancel()
+	count, err := a.worker.RepairCompleteCollections(ctx)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "count": count})
 }
 
 func (a *API) tvShows(w http.ResponseWriter, r *http.Request) {
@@ -1029,6 +1131,42 @@ func (a *API) collection(w http.ResponseWriter, r *http.Request) {
 	collection, err := a.store.Collection(ctx, id)
 	if err != nil {
 		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, collection)
+}
+
+func (a *API) curatedCollection(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := contextWithTimeout(r)
+	defer cancel()
+	id := strings.TrimSpace(chi.URLParam(r, "listID"))
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "榜单 ID 无效")
+		return
+	}
+	collection, err := a.store.CuratedCollection(ctx, id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, collection)
+}
+
+func (a *API) refreshCuratedCollection(w http.ResponseWriter, r *http.Request) {
+	if a.curated == nil {
+		writeError(w, http.StatusBadRequest, "固定榜单刷新服务未启用")
+		return
+	}
+	id := strings.TrimSpace(chi.URLParam(r, "listID"))
+	if id != models.CuratedDoubanTop250ID {
+		writeError(w, http.StatusNotFound, "固定榜单不存在")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Minute)
+	defer cancel()
+	collection, err := a.curated.RefreshTop250(ctx)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, collection)
@@ -1115,23 +1253,12 @@ func isHiddenSecret(value string) bool {
 	return value != "" && strings.Trim(value, "*") == ""
 }
 
-func redactedSecret(value string) string {
-	if strings.TrimSpace(value) == "" {
-		return ""
-	}
-	return hiddenSecretValue
-}
-
-func redactSystemSettings(settings models.SystemSettings) models.SystemSettings {
-	settings.TMDBAPIKey = redactedSecret(settings.TMDBAPIKey)
-	settings.CloudDrivePassword = redactedSecret(settings.CloudDrivePassword)
-	settings.CloudDriveToken = redactedSecret(settings.CloudDriveToken)
-	return settings
-}
-
 func mergeHiddenSystemSettings(next *models.SystemSettings, existing models.SystemSettings) {
 	if isHiddenSecret(next.TMDBAPIKey) {
 		next.TMDBAPIKey = existing.TMDBAPIKey
+	}
+	if isHiddenSecret(next.AIAPIKey) {
+		next.AIAPIKey = existing.AIAPIKey
 	}
 	if isHiddenSecret(next.CloudDrivePassword) {
 		next.CloudDrivePassword = existing.CloudDrivePassword
@@ -1141,12 +1268,6 @@ func mergeHiddenSystemSettings(next *models.SystemSettings, existing models.Syst
 	}
 }
 
-func redactCloudDriveSettings(settings models.CloudDriveSettings) models.CloudDriveSettings {
-	settings.Password = redactedSecret(settings.Password)
-	settings.Token = redactedSecret(settings.Token)
-	return settings
-}
-
 func mergeHiddenCloudDriveSettings(next *models.CloudDriveSettings, existing models.CloudDriveSettings) {
 	if isHiddenSecret(next.Password) {
 		next.Password = existing.Password
@@ -1154,13 +1275,6 @@ func mergeHiddenCloudDriveSettings(next *models.CloudDriveSettings, existing mod
 	if isHiddenSecret(next.Token) {
 		next.Token = existing.Token
 	}
-}
-
-func redactP115Settings(settings models.P115Settings) models.P115Settings {
-	settings.AppSecret = redactedSecret(settings.AppSecret)
-	settings.Cookies = redactedSecret(settings.Cookies)
-	settings.EmbyAPIKey = redactedSecret(settings.EmbyAPIKey)
-	return settings
 }
 
 func mergeHiddenP115Settings(next *models.P115Settings, existing models.P115Settings) {
@@ -1241,10 +1355,10 @@ func validateP115Settings(settings models.P115Settings) (models.P115Settings, er
 	settings.DirectURLTTLSeconds = 3000
 	settings.UserAgentMode = "inherit"
 	settings.FixedUserAgent = ""
-	settings.LibrariesYAML = strings.TrimSpace(settings.LibrariesYAML)
-	if settings.LibrariesYAML != "" {
-		if _, err := p115.ParseLibraries(settings.LibrariesYAML); err != nil {
-			return models.P115Settings{}, errors.New("115 媒体库 CID 配置无效：" + err.Error())
+	settings.LibraryCID = strings.TrimSpace(settings.LibraryCID)
+	if settings.LibraryCID != "" {
+		if _, err := p115.ParseLibraryCID(settings.LibraryCID); err != nil {
+			return models.P115Settings{}, err
 		}
 	}
 	if settings.KeepDeletedDays <= 0 {

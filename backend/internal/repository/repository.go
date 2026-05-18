@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"sort"
 	"strings"
 	"time"
 
+	"curio/internal/config"
 	"curio/internal/models"
 
 	"github.com/jackc/pgx/v5"
@@ -17,6 +19,11 @@ import (
 
 type Store struct {
 	db *pgxpool.Pool
+}
+
+type CollectionRepairCandidate struct {
+	Collection models.CollectionMetadata
+	FilePaths  []string
 }
 
 func New(db *pgxpool.Pool) *Store {
@@ -45,6 +52,12 @@ func (s *Store) Migrate(ctx context.Context) error {
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
 		`ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS classification_yaml TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS ai_filename_enabled BOOLEAN NOT NULL DEFAULT false`,
+		`ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS ai_filename_force BOOLEAN NOT NULL DEFAULT false`,
+		`ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS ai_base_url TEXT NOT NULL DEFAULT 'https://api.openai.com/v1'`,
+		`ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS ai_api_key TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS ai_model TEXT NOT NULL DEFAULT 'gpt-5.5'`,
+		`ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS ai_filename_prompt TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS clouddrive_address TEXT NOT NULL DEFAULT 'http://localhost:19798'`,
 		`ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS clouddrive_username TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS clouddrive_password TEXT NOT NULL DEFAULT ''`,
@@ -68,7 +81,7 @@ func (s *Store) Migrate(ctx context.Context) error {
 			direct_url_ttl_seconds INT NOT NULL DEFAULT 3000,
 			user_agent_mode TEXT NOT NULL DEFAULT 'inherit',
 			fixed_user_agent TEXT NOT NULL DEFAULT '',
-			libraries_yaml TEXT NOT NULL DEFAULT '',
+			library_cid TEXT NOT NULL DEFAULT '',
 			delete_missing_strm BOOLEAN NOT NULL DEFAULT true,
 			stale_before_delete BOOLEAN NOT NULL DEFAULT false,
 			keep_deleted_days INT NOT NULL DEFAULT 7,
@@ -86,6 +99,20 @@ func (s *Store) Migrate(ctx context.Context) error {
 		`ALTER TABLE p115_settings ADD COLUMN IF NOT EXISTS emby_proxy_port INT NOT NULL DEFAULT 8097`,
 		`ALTER TABLE p115_settings ADD COLUMN IF NOT EXISTS sync_cron_enabled BOOLEAN NOT NULL DEFAULT false`,
 		`ALTER TABLE p115_settings ADD COLUMN IF NOT EXISTS sync_interval_minutes INT NOT NULL DEFAULT 60`,
+		`ALTER TABLE p115_settings ADD COLUMN IF NOT EXISTS library_cid TEXT NOT NULL DEFAULT ''`,
+		`DO $$
+		BEGIN
+			IF EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_name='p115_settings' AND column_name='libraries_yaml'
+			) THEN
+				UPDATE p115_settings
+				SET library_cid = btrim(libraries_yaml)
+				WHERE library_cid = ''
+					AND btrim(libraries_yaml) <> ''
+					AND btrim(libraries_yaml) !~ '[[:space:]:]';
+			END IF;
+		END $$`,
 		`CREATE TABLE IF NOT EXISTS strm_links (
 			id TEXT PRIMARY KEY,
 			provider TEXT NOT NULL,
@@ -106,11 +133,19 @@ func (s *Store) Migrate(ctx context.Context) error {
 			status TEXT NOT NULL DEFAULT 'generated',
 			error_code TEXT NOT NULL DEFAULT '',
 			error_message TEXT NOT NULL DEFAULT '',
+			media_streams_json TEXT NOT NULL DEFAULT '',
+			media_duration_ticks BIGINT NOT NULL DEFAULT 0,
+			media_probed_at TIMESTAMPTZ,
+			media_probe_error TEXT NOT NULL DEFAULT '',
 			generated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			resolved_at TIMESTAMPTZ,
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			UNIQUE(provider, library_cid, relative_path)
 		)`,
+		`ALTER TABLE strm_links ADD COLUMN IF NOT EXISTS media_streams_json TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE strm_links ADD COLUMN IF NOT EXISTS media_duration_ticks BIGINT NOT NULL DEFAULT 0`,
+		`ALTER TABLE strm_links ADD COLUMN IF NOT EXISTS media_probed_at TIMESTAMPTZ`,
+		`ALTER TABLE strm_links ADD COLUMN IF NOT EXISTS media_probe_error TEXT NOT NULL DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS idx_strm_links_path ON strm_links(strm_path)`,
 		`CREATE INDEX IF NOT EXISTS idx_strm_links_library ON strm_links(provider, library_cid, status)`,
 		`CREATE TABLE IF NOT EXISTS p115_tree_snapshots (
@@ -181,10 +216,12 @@ func (s *Store) Migrate(ctx context.Context) error {
 			skipped INT NOT NULL DEFAULT 0,
 			failed INT NOT NULL DEFAULT 0,
 			error_message TEXT NOT NULL DEFAULT '',
+			event_summary TEXT NOT NULL DEFAULT '',
 			started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			ended_at TIMESTAMPTZ,
 			duration_ms BIGINT NOT NULL DEFAULT 0
 		)`,
+		`ALTER TABLE p115_sync_runs ADD COLUMN IF NOT EXISTS event_summary TEXT NOT NULL DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS idx_p115_sync_runs_started ON p115_sync_runs(started_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_p115_sync_runs_trigger ON p115_sync_runs(trigger, started_at DESC)`,
 		`CREATE TABLE IF NOT EXISTS emby_strm_items (
@@ -292,6 +329,38 @@ func (s *Store) Migrate(ctx context.Context) error {
 		`DELETE FROM media_files WHERE process_status='failed' AND error_code='UNSUPPORTED_EXTENSION' AND media_type=''`,
 		`CREATE INDEX IF NOT EXISTS idx_media_files_batch ON media_files(batch_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_media_files_status ON media_files(process_status)`,
+		`CREATE TABLE IF NOT EXISTS ai_filename_logs (
+			id TEXT PRIMARY KEY,
+			batch_id TEXT NOT NULL DEFAULT '',
+			file_id TEXT NOT NULL DEFAULT '',
+			file_path TEXT NOT NULL DEFAULT '',
+			file_name TEXT NOT NULL DEFAULT '',
+			source TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL DEFAULT '',
+			model TEXT NOT NULL DEFAULT '',
+			base_url TEXT NOT NULL DEFAULT '',
+			proxy_url TEXT NOT NULL DEFAULT '',
+			response_format TEXT NOT NULL DEFAULT '',
+			request_json TEXT NOT NULL DEFAULT '',
+			response_json TEXT NOT NULL DEFAULT '',
+			parsed_json TEXT NOT NULL DEFAULT '',
+			http_status INT NOT NULL DEFAULT 0,
+			duration_ms BIGINT NOT NULL DEFAULT 0,
+			attempt INT NOT NULL DEFAULT 0,
+			media_type TEXT NOT NULL DEFAULT '',
+			title TEXT NOT NULL DEFAULT '',
+			year INT NOT NULL DEFAULT 0,
+			season INT NOT NULL DEFAULT 0,
+			episode INT NOT NULL DEFAULT 0,
+			confidence NUMERIC NOT NULL DEFAULT 0,
+			needs_review BOOLEAN NOT NULL DEFAULT false,
+			reason TEXT NOT NULL DEFAULT '',
+			error_message TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_ai_filename_logs_created ON ai_filename_logs(created_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_ai_filename_logs_batch ON ai_filename_logs(batch_id, created_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_ai_filename_logs_file ON ai_filename_logs(file_id)`,
 		`CREATE TABLE IF NOT EXISTS movies (
 			tmdb_id INT PRIMARY KEY,
 			imdb_id TEXT NOT NULL DEFAULT '',
@@ -384,6 +453,54 @@ func (s *Store) Migrate(ctx context.Context) error {
 		`UPDATE collections c SET
 			movie_count = COALESCE((SELECT COUNT(*)::INT FROM collection_movies cm WHERE cm.collection_id=c.tmdb_id AND cm.released=true), 0),
 			unreleased_count = COALESCE((SELECT COUNT(*)::INT FROM collection_movies cm WHERE cm.collection_id=c.tmdb_id AND cm.released=false), 0)`,
+		`CREATE TABLE IF NOT EXISTS curated_collections (
+			id TEXT PRIMARY KEY,
+			source TEXT NOT NULL DEFAULT '',
+			name TEXT NOT NULL,
+			overview TEXT NOT NULL DEFAULT '',
+			source_url TEXT NOT NULL DEFAULT '',
+			item_count INT NOT NULL DEFAULT 0,
+			resolved_count INT NOT NULL DEFAULT 0,
+			local_count INT NOT NULL DEFAULT 0,
+			missing_count INT NOT NULL DEFAULT 0,
+			unresolved_count INT NOT NULL DEFAULT 0,
+			status TEXT NOT NULL DEFAULT 'incomplete',
+			poster_path TEXT NOT NULL DEFAULT '',
+			backdrop_path TEXT NOT NULL DEFAULT '',
+			refreshed_at TIMESTAMPTZ,
+			last_refresh_error TEXT NOT NULL DEFAULT '',
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`,
+		`CREATE TABLE IF NOT EXISTS curated_collection_movies (
+			list_id TEXT NOT NULL REFERENCES curated_collections(id) ON DELETE CASCADE,
+			rank INT NOT NULL DEFAULT 0,
+			douban_id TEXT NOT NULL,
+			imdb_id TEXT NOT NULL DEFAULT '',
+			movie_tmdb_id INT NOT NULL DEFAULT 0,
+			title TEXT NOT NULL,
+			original_title TEXT NOT NULL DEFAULT '',
+			year INT NOT NULL DEFAULT 0,
+			release_date TEXT NOT NULL DEFAULT '',
+			rating TEXT NOT NULL DEFAULT '',
+			poster_path TEXT NOT NULL DEFAULT '',
+			backdrop_path TEXT NOT NULL DEFAULT '',
+			source_url TEXT NOT NULL DEFAULT '',
+			match_status TEXT NOT NULL DEFAULT 'pending',
+			error_message TEXT NOT NULL DEFAULT '',
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			PRIMARY KEY(list_id, douban_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_curated_collection_movies_list_rank ON curated_collection_movies(list_id, rank)`,
+		`CREATE INDEX IF NOT EXISTS idx_curated_collection_movies_tmdb ON curated_collection_movies(movie_tmdb_id)`,
+		`INSERT INTO curated_collections (id, source, name, overview, source_url, item_count, status)
+			VALUES ('douban_top250', 'douban', '豆瓣电影 Top250', '豆瓣电影 Top250 固定榜单，每天自动刷新并统计本地已有影片。', 'https://m.douban.com/subject_collection/movie_top250/', 0, 'incomplete')
+			ON CONFLICT (id) DO NOTHING`,
+		`UPDATE curated_collections SET source_url='https://m.douban.com/subject_collection/movie_top250/', updated_at=now()
+			WHERE id='douban_top250' AND source_url IN ('', 'https://movie.douban.com/top250')`,
+		`UPDATE curated_collections cc SET item_count=0, resolved_count=0, local_count=0, missing_count=0,
+			unresolved_count=0, status='incomplete', updated_at=now()
+			WHERE cc.id='douban_top250'
+				AND NOT EXISTS (SELECT 1 FROM curated_collection_movies ccm WHERE ccm.list_id=cc.id)`,
 		`CREATE TABLE IF NOT EXISTS media_matches (
 			file_id TEXT PRIMARY KEY REFERENCES media_files(id) ON DELETE CASCADE,
 			target_type TEXT NOT NULL,
@@ -403,8 +520,10 @@ func (s *Store) Migrate(ctx context.Context) error {
 			task_status TEXT NOT NULL,
 			error_code TEXT NOT NULL DEFAULT '',
 			error_message TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			executed_at TIMESTAMPTZ
 		)`,
+		`ALTER TABLE organize_tasks ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now()`,
 		`CREATE TABLE IF NOT EXISTS operation_histories (
 			id TEXT PRIMARY KEY,
 			task_id TEXT NOT NULL DEFAULT '',
@@ -449,10 +568,12 @@ func (s *Store) Seed(ctx context.Context, dirs models.DirectoryConfig, settings 
 		return err
 	}
 	if _, err := s.db.Exec(ctx, `INSERT INTO system_settings (id, tmdb_api_key, network_proxy, classification_yaml,
+		ai_filename_enabled, ai_filename_force, ai_base_url, ai_api_key, ai_model, ai_filename_prompt,
 		clouddrive_address, clouddrive_username, clouddrive_password, clouddrive_token,
 		clouddrive_root_path, clouddrive_staging_path, clouddrive_failed_path, clouddrive_incomplete_path)
-		VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) ON CONFLICT (id) DO NOTHING`,
+		VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) ON CONFLICT (id) DO NOTHING`,
 		settings.TMDBAPIKey, settings.NetworkProxy, settings.ClassificationYAML,
+		settings.AIFilenameEnabled, settings.AIFilenameForce, settings.AIBaseURL, settings.AIAPIKey, settings.AIModel, settings.AIFilenamePrompt,
 		settings.CloudDriveAddress, settings.CloudDriveUsername, settings.CloudDrivePassword, settings.CloudDriveToken,
 		settings.CloudDriveRootPath, settings.CloudDriveStagingPath, settings.CloudDriveFailedPath, settings.CloudDriveIncompletePath); err != nil {
 		return err
@@ -475,20 +596,30 @@ func (s *Store) Seed(ctx context.Context, dirs models.DirectoryConfig, settings 
 func (s *Store) Settings(ctx context.Context) (models.SystemSettings, error) {
 	var settings models.SystemSettings
 	err := s.db.QueryRow(ctx, `SELECT tmdb_api_key, network_proxy, classification_yaml,
+		ai_filename_enabled, ai_filename_force, ai_base_url, ai_api_key, ai_model, ai_filename_prompt,
 		clouddrive_address, clouddrive_username, clouddrive_password, clouddrive_token,
 		clouddrive_root_path, clouddrive_staging_path, clouddrive_failed_path, clouddrive_incomplete_path, updated_at
 		FROM system_settings WHERE id=1`).
 		Scan(&settings.TMDBAPIKey, &settings.NetworkProxy, &settings.ClassificationYAML,
+			&settings.AIFilenameEnabled, &settings.AIFilenameForce, &settings.AIBaseURL, &settings.AIAPIKey, &settings.AIModel, &settings.AIFilenamePrompt,
 			&settings.CloudDriveAddress, &settings.CloudDriveUsername, &settings.CloudDrivePassword, &settings.CloudDriveToken,
 			&settings.CloudDriveRootPath, &settings.CloudDriveStagingPath, &settings.CloudDriveFailedPath, &settings.CloudDriveIncompletePath, &settings.UpdatedAt)
-	return settings, err
+	if err != nil {
+		return settings, err
+	}
+	return normalizeSystemSettings(settings), nil
 }
 
 func (s *Store) SaveSettings(ctx context.Context, settings models.SystemSettings) (models.SystemSettings, error) {
-	_, err := s.db.Exec(ctx, `INSERT INTO system_settings (id, tmdb_api_key, network_proxy, classification_yaml)
-		VALUES (1, $1, $2, $3)
-		ON CONFLICT (id) DO UPDATE SET tmdb_api_key=$1, network_proxy=$2, classification_yaml=$3, updated_at=now()`,
-		settings.TMDBAPIKey, settings.NetworkProxy, settings.ClassificationYAML)
+	settings = normalizeSystemSettings(settings)
+	_, err := s.db.Exec(ctx, `INSERT INTO system_settings (id, tmdb_api_key, network_proxy, classification_yaml,
+			ai_filename_enabled, ai_filename_force, ai_base_url, ai_api_key, ai_model, ai_filename_prompt)
+		VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9)
+		ON CONFLICT (id) DO UPDATE SET tmdb_api_key=$1, network_proxy=$2, classification_yaml=$3,
+			ai_filename_enabled=$4, ai_filename_force=$5, ai_base_url=$6, ai_api_key=$7, ai_model=$8,
+			ai_filename_prompt=$9, updated_at=now()`,
+		settings.TMDBAPIKey, settings.NetworkProxy, settings.ClassificationYAML,
+		settings.AIFilenameEnabled, settings.AIFilenameForce, settings.AIBaseURL, settings.AIAPIKey, settings.AIModel, settings.AIFilenamePrompt)
 	if err != nil {
 		return models.SystemSettings{}, err
 	}
@@ -502,6 +633,22 @@ func (s *Store) SaveClassification(ctx context.Context, yaml string) (models.Sys
 	}
 	current.ClassificationYAML = yaml
 	return s.SaveSettings(ctx, current)
+}
+
+func normalizeSystemSettings(settings models.SystemSettings) models.SystemSettings {
+	settings.AIBaseURL = strings.TrimRight(strings.TrimSpace(settings.AIBaseURL), "/")
+	if settings.AIBaseURL == "" {
+		settings.AIBaseURL = "https://api.openai.com/v1"
+	}
+	settings.AIModel = strings.TrimSpace(settings.AIModel)
+	if settings.AIModel == "" {
+		settings.AIModel = "gpt-5.5"
+	}
+	settings.AIFilenamePrompt = strings.TrimSpace(settings.AIFilenamePrompt)
+	if settings.AIFilenamePrompt == "" {
+		settings.AIFilenamePrompt = config.DefaultAIFilenamePrompt
+	}
+	return settings
 }
 
 func (s *Store) CloudDriveSettings(ctx context.Context) (models.CloudDriveSettings, error) {
@@ -542,12 +689,12 @@ func cloudDriveFromSystem(settings models.SystemSettings) models.CloudDriveSetti
 func (s *Store) P115Settings(ctx context.Context) (models.P115Settings, error) {
 	var settings models.P115Settings
 	err := s.db.QueryRow(ctx, `SELECT enabled, auth_mode, app_id, app_secret, access_token, refresh_token, cookies, cookie_login_app,
-		strm_output_path, public_base_url, direct_url_ttl_seconds, user_agent_mode, fixed_user_agent, libraries_yaml,
+		strm_output_path, public_base_url, direct_url_ttl_seconds, user_agent_mode, fixed_user_agent, library_cid,
 		delete_missing_strm, stale_before_delete, keep_deleted_days, refresh_emby_after_sync, sync_cron_enabled, sync_interval_minutes,
 		emby_upstream_url, emby_public_url, emby_proxy_port, emby_proxy_base_path, emby_api_key, updated_at
 		FROM p115_settings WHERE id=1`).
 		Scan(&settings.Enabled, &settings.AuthMode, &settings.AppID, &settings.AppSecret, &settings.AccessToken, &settings.RefreshToken, &settings.Cookies, &settings.CookieLoginApp,
-			&settings.STRMOutputPath, &settings.PublicBaseURL, &settings.DirectURLTTLSeconds, &settings.UserAgentMode, &settings.FixedUserAgent, &settings.LibrariesYAML,
+			&settings.STRMOutputPath, &settings.PublicBaseURL, &settings.DirectURLTTLSeconds, &settings.UserAgentMode, &settings.FixedUserAgent, &settings.LibraryCID,
 			&settings.DeleteMissingSTRM, &settings.StaleBeforeDelete, &settings.KeepDeletedDays, &settings.RefreshEmbyAfterSync, &settings.SyncCronEnabled, &settings.SyncIntervalMinutes,
 			&settings.EmbyUpstreamURL, &settings.EmbyPublicURL, &settings.EmbyProxyPort, &settings.EmbyProxyBasePath, &settings.EmbyAPIKey, &settings.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -575,17 +722,17 @@ func (s *Store) P115Settings(ctx context.Context) (models.P115Settings, error) {
 func (s *Store) SaveP115Settings(ctx context.Context, settings models.P115Settings) (models.P115Settings, error) {
 	_, err := s.db.Exec(ctx, `INSERT INTO p115_settings (
 		id, enabled, auth_mode, app_id, app_secret, access_token, refresh_token, cookies, cookie_login_app,
-		strm_output_path, public_base_url, direct_url_ttl_seconds, user_agent_mode, fixed_user_agent, libraries_yaml,
+		strm_output_path, public_base_url, direct_url_ttl_seconds, user_agent_mode, fixed_user_agent, library_cid,
 		delete_missing_strm, stale_before_delete, keep_deleted_days, refresh_emby_after_sync, sync_cron_enabled, sync_interval_minutes,
 		emby_upstream_url, emby_public_url, emby_proxy_port, emby_proxy_base_path, emby_api_key
 	) VALUES (1,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
 	ON CONFLICT (id) DO UPDATE SET
 		enabled=$1, auth_mode=$2, app_id=$3, app_secret=$4, access_token=$5, refresh_token=$6, cookies=$7, cookie_login_app=$8,
-		strm_output_path=$9, public_base_url=$10, direct_url_ttl_seconds=$11, user_agent_mode=$12, fixed_user_agent=$13, libraries_yaml=$14,
+		strm_output_path=$9, public_base_url=$10, direct_url_ttl_seconds=$11, user_agent_mode=$12, fixed_user_agent=$13, library_cid=$14,
 		delete_missing_strm=$15, stale_before_delete=$16, keep_deleted_days=$17, refresh_emby_after_sync=$18, sync_cron_enabled=$19, sync_interval_minutes=$20,
 		emby_upstream_url=$21, emby_public_url=$22, emby_proxy_port=$23, emby_proxy_base_path=$24, emby_api_key=$25, updated_at=now()`,
 		settings.Enabled, settings.AuthMode, settings.AppID, settings.AppSecret, settings.AccessToken, settings.RefreshToken, settings.Cookies, settings.CookieLoginApp,
-		settings.STRMOutputPath, settings.PublicBaseURL, settings.DirectURLTTLSeconds, settings.UserAgentMode, settings.FixedUserAgent, settings.LibrariesYAML,
+		settings.STRMOutputPath, settings.PublicBaseURL, settings.DirectURLTTLSeconds, settings.UserAgentMode, settings.FixedUserAgent, settings.LibraryCID,
 		settings.DeleteMissingSTRM, settings.StaleBeforeDelete, settings.KeepDeletedDays, settings.RefreshEmbyAfterSync, settings.SyncCronEnabled, settings.SyncIntervalMinutes,
 		settings.EmbyUpstreamURL, settings.EmbyPublicURL, settings.EmbyProxyPort, settings.EmbyProxyBasePath, settings.EmbyAPIKey)
 	if err != nil {
@@ -616,7 +763,7 @@ func (s *Store) UpsertSTRMLink(ctx context.Context, link models.STRMLink) error 
 func (s *Store) STRMLink(ctx context.Context, id string) (models.STRMLink, error) {
 	rows, err := s.db.Query(ctx, `SELECT id, provider, library_cid, library_name, library_type, relative_path, remote_path,
 		remote_file_id, pickcode, sha1, size, strm_path, play_path, source_tree_hash, tree_version, resolve_status, status,
-		error_code, error_message, generated_at, resolved_at, updated_at
+		error_code, error_message, media_streams_json, media_duration_ticks, media_probed_at, media_probe_error, generated_at, resolved_at, updated_at
 		FROM strm_links WHERE id=$1`, id)
 	if err != nil {
 		return models.STRMLink{}, err
@@ -631,7 +778,7 @@ func (s *Store) STRMLink(ctx context.Context, id string) (models.STRMLink, error
 func (s *Store) STRMLinkByPath(ctx context.Context, path string) (models.STRMLink, error) {
 	rows, err := s.db.Query(ctx, `SELECT id, provider, library_cid, library_name, library_type, relative_path, remote_path,
 		remote_file_id, pickcode, sha1, size, strm_path, play_path, source_tree_hash, tree_version, resolve_status, status,
-		error_code, error_message, generated_at, resolved_at, updated_at
+		error_code, error_message, media_streams_json, media_duration_ticks, media_probed_at, media_probe_error, generated_at, resolved_at, updated_at
 		FROM strm_links WHERE strm_path=$1 OR play_path=$1 ORDER BY updated_at DESC LIMIT 1`, path)
 	if err != nil {
 		return models.STRMLink{}, err
@@ -665,7 +812,7 @@ func (s *Store) STRMLinkByPlayRoute(ctx context.Context, provider, route string,
 	relativeSuffix := "/" + route
 	rows, err := s.db.Query(ctx, `SELECT id, provider, library_cid, library_name, library_type, relative_path, remote_path,
 		remote_file_id, pickcode, sha1, size, strm_path, play_path, source_tree_hash, tree_version, resolve_status, status,
-		error_code, error_message, generated_at, resolved_at, updated_at
+		error_code, error_message, media_streams_json, media_duration_ticks, media_probed_at, media_probe_error, generated_at, resolved_at, updated_at
 		FROM strm_links
 		WHERE provider=$1 AND status=$2 AND (
 			play_path=ANY($3)
@@ -693,7 +840,7 @@ func (s *Store) STRMLinkByPlayRoute(ctx context.Context, provider, route string,
 func (s *Store) STRMLinkByEmbyItem(ctx context.Context, serverID, itemID string) (models.STRMLink, error) {
 	rows, err := s.db.Query(ctx, `SELECT sl.id, sl.provider, sl.library_cid, sl.library_name, sl.library_type, sl.relative_path, sl.remote_path,
 		sl.remote_file_id, sl.pickcode, sl.sha1, sl.size, sl.strm_path, sl.play_path, sl.source_tree_hash, sl.tree_version, sl.resolve_status, sl.status,
-		sl.error_code, sl.error_message, sl.generated_at, sl.resolved_at, sl.updated_at
+		sl.error_code, sl.error_message, sl.media_streams_json, sl.media_duration_ticks, sl.media_probed_at, sl.media_probe_error, sl.generated_at, sl.resolved_at, sl.updated_at
 		FROM emby_strm_items ei
 		JOIN strm_links sl ON sl.id=ei.strm_link_id
 		WHERE ei.emby_server_id=$1 AND ei.emby_item_id=$2 AND ei.status='active'
@@ -723,7 +870,7 @@ func (s *Store) NextSTRMLinks(ctx context.Context, link models.STRMLink, limit i
 	prefix := strings.TrimRight(dir, "/") + "/"
 	rows, err := s.db.Query(ctx, `SELECT id, provider, library_cid, library_name, library_type, relative_path, remote_path,
 		remote_file_id, pickcode, sha1, size, strm_path, play_path, source_tree_hash, tree_version, resolve_status, status,
-		error_code, error_message, generated_at, resolved_at, updated_at
+		error_code, error_message, media_streams_json, media_duration_ticks, media_probed_at, media_probe_error, generated_at, resolved_at, updated_at
 		FROM strm_links
 		WHERE provider=$1 AND library_cid=$2 AND status=$3
 			AND relative_path>$4
@@ -748,7 +895,7 @@ func (s *Store) NextSTRMLinks(ctx context.Context, link models.STRMLink, limit i
 func (s *Store) ActiveSTRMLinksByLibrary(ctx context.Context, provider, libraryCID string) ([]models.STRMLink, error) {
 	rows, err := s.db.Query(ctx, `SELECT id, provider, library_cid, library_name, library_type, relative_path, remote_path,
 		remote_file_id, pickcode, sha1, size, strm_path, play_path, source_tree_hash, tree_version, resolve_status, status,
-		error_code, error_message, generated_at, resolved_at, updated_at
+		error_code, error_message, media_streams_json, media_duration_ticks, media_probed_at, media_probe_error, generated_at, resolved_at, updated_at
 		FROM strm_links WHERE provider=$1 AND library_cid=$2 AND status IN ($3,$4)`, provider, libraryCID, models.STRMStatusGenerated, models.STRMStatusStale)
 	if err != nil {
 		return nil, err
@@ -771,7 +918,7 @@ func (s *Store) STRMLinksByStatuses(ctx context.Context, statuses []string) ([]m
 	}
 	rows, err := s.db.Query(ctx, `SELECT id, provider, library_cid, library_name, library_type, relative_path, remote_path,
 		remote_file_id, pickcode, sha1, size, strm_path, play_path, source_tree_hash, tree_version, resolve_status, status,
-		error_code, error_message, generated_at, resolved_at, updated_at
+		error_code, error_message, media_streams_json, media_duration_ticks, media_probed_at, media_probe_error, generated_at, resolved_at, updated_at
 		FROM strm_links WHERE status=ANY($1)`, statuses)
 	if err != nil {
 		return nil, err
@@ -806,6 +953,15 @@ func (s *Store) UpdateSTRMLinkPlayPath(ctx context.Context, id, playPath string)
 	return err
 }
 
+func (s *Store) UpdateSTRMLinkMediaStreams(ctx context.Context, id, streamsJSON string, durationTicks int64, probeError string) error {
+	_, err := s.db.Exec(ctx, `UPDATE strm_links SET
+		media_streams_json=CASE WHEN $4 = '' THEN $2 ELSE media_streams_json END,
+		media_duration_ticks=CASE WHEN $4 = '' THEN $3 ELSE media_duration_ticks END,
+		media_probe_error=$4, media_probed_at=now(), updated_at=now() WHERE id=$1`,
+		id, streamsJSON, durationTicks, probeError)
+	return err
+}
+
 func (s *Store) CreateP115SyncRun(ctx context.Context, run models.P115SyncRun) error {
 	if run.Status == "" {
 		run.Status = models.P115SyncStatusRunning
@@ -814,19 +970,19 @@ func (s *Store) CreateP115SyncRun(ctx context.Context, run models.P115SyncRun) e
 		run.StartedAt = time.Now()
 	}
 	_, err := s.db.Exec(ctx, `INSERT INTO p115_sync_runs
-		(id, trigger, status, mode, tree_version, exported, generated, restored, updated_count, deleted_count, skipped, failed, error_message, started_at, duration_ms)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
-		run.ID, run.Trigger, run.Status, run.Mode, run.TreeVersion, run.Exported, run.Generated, run.Restored, run.Updated, run.Deleted, run.Skipped, run.Failed, run.ErrorMessage, run.StartedAt, run.DurationMS)
+		(id, trigger, status, mode, tree_version, exported, generated, restored, updated_count, deleted_count, skipped, failed, error_message, event_summary, started_at, duration_ms)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+		run.ID, run.Trigger, run.Status, run.Mode, run.TreeVersion, run.Exported, run.Generated, run.Restored, run.Updated, run.Deleted, run.Skipped, run.Failed, run.ErrorMessage, run.EventSummary, run.StartedAt, run.DurationMS)
 	return err
 }
 
 func (s *Store) FinishP115SyncRun(ctx context.Context, run models.P115SyncRun) error {
 	_, err := s.db.Exec(ctx, `UPDATE p115_sync_runs SET
 		status=$2, mode=$3, tree_version=$4, exported=$5, generated=$6, restored=$7, updated_count=$8,
-		deleted_count=$9, skipped=$10, failed=$11, error_message=$12, ended_at=$13, duration_ms=$14
+		deleted_count=$9, skipped=$10, failed=$11, error_message=$12, event_summary=$13, ended_at=$14, duration_ms=$15
 		WHERE id=$1`,
 		run.ID, run.Status, run.Mode, run.TreeVersion, run.Exported, run.Generated, run.Restored, run.Updated,
-		run.Deleted, run.Skipped, run.Failed, run.ErrorMessage, run.EndedAt, run.DurationMS)
+		run.Deleted, run.Skipped, run.Failed, run.ErrorMessage, run.EventSummary, run.EndedAt, run.DurationMS)
 	return err
 }
 
@@ -835,7 +991,7 @@ func (s *Store) P115SyncRuns(ctx context.Context, limit int) ([]models.P115SyncR
 		limit = 20
 	}
 	rows, err := s.db.Query(ctx, `SELECT id, trigger, status, mode, tree_version, exported, generated, restored, updated_count,
-		deleted_count, skipped, failed, error_message, started_at, ended_at, duration_ms
+		deleted_count, skipped, failed, error_message, event_summary, started_at, ended_at, duration_ms
 		FROM p115_sync_runs ORDER BY started_at DESC LIMIT $1`, limit)
 	if err != nil {
 		return nil, err
@@ -857,7 +1013,7 @@ func (s *Store) LatestP115SyncRun(ctx context.Context, triggers []string) (model
 		return models.P115SyncRun{}, false, nil
 	}
 	rows, err := s.db.Query(ctx, `SELECT id, trigger, status, mode, tree_version, exported, generated, restored, updated_count,
-		deleted_count, skipped, failed, error_message, started_at, ended_at, duration_ms
+		deleted_count, skipped, failed, error_message, event_summary, started_at, ended_at, duration_ms
 		FROM p115_sync_runs WHERE trigger=ANY($1) ORDER BY started_at DESC LIMIT 1`, triggers)
 	if err != nil {
 		return models.P115SyncRun{}, false, err
@@ -868,6 +1024,117 @@ func (s *Store) LatestP115SyncRun(ctx context.Context, triggers []string) (model
 	}
 	run, err := scanP115SyncRun(rows)
 	return run, err == nil, err
+}
+
+func (s *Store) AddAIFilenameLog(ctx context.Context, entry models.AIFilenameLog) error {
+	_, err := s.db.Exec(ctx, `INSERT INTO ai_filename_logs
+		(id, batch_id, file_id, file_path, file_name, source, status, model, base_url, proxy_url, response_format,
+			request_json, response_json, parsed_json, http_status, duration_ms, attempt, media_type, title, year, season, episode,
+			confidence, needs_review, reason, error_message)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)`,
+		entry.ID, entry.BatchID, entry.FileID, entry.FilePath, entry.FileName, entry.Source, entry.Status, entry.Model, entry.BaseURL,
+		entry.ProxyURL, entry.ResponseFormat, entry.RequestJSON, entry.ResponseJSON, entry.ParsedJSON, entry.HTTPStatus, entry.DurationMS,
+		entry.Attempt, entry.MediaType, entry.Title, entry.Year, entry.Season, entry.Episode, entry.Confidence, entry.NeedsReview,
+		entry.Reason, entry.ErrorMessage)
+	return err
+}
+
+func (s *Store) AttachAIFilenameLogFile(ctx context.Context, batchID, filePath, fileID string) error {
+	if batchID == "" || filePath == "" || fileID == "" {
+		return nil
+	}
+	_, err := s.db.Exec(ctx, `UPDATE ai_filename_logs SET file_id=$3
+		WHERE batch_id=$1 AND file_path=$2 AND file_id=''`, batchID, filePath, fileID)
+	return err
+}
+
+func (s *Store) LogEntries(ctx context.Context, logType string, limit int) (models.LogPage, error) {
+	logType = strings.TrimSpace(logType)
+	if logType == "" {
+		logType = "all"
+	}
+	if limit <= 0 || limit > 500 {
+		limit = 200
+	}
+	entries := make([]models.LogEntry, 0, limit)
+	if includeLogType(logType, "ai_filename") {
+		rows, err := s.db.Query(ctx, `SELECT id, 'ai_filename', 'AI 文件名', status,
+			CASE WHEN status='success' THEN COALESCE(NULLIF(title, ''), file_name, file_path) ELSE 'AI 文件名识别失败' END,
+			reason, batch_id, file_id, file_name, file_path, model, base_url, proxy_url, response_format,
+			request_json, response_json, parsed_json, http_status, duration_ms, error_message, created_at
+			FROM ai_filename_logs ORDER BY created_at DESC LIMIT $1`, limit)
+		if err != nil {
+			return models.LogPage{}, err
+		}
+		if err := appendLogRows(rows, &entries); err != nil {
+			return models.LogPage{}, err
+		}
+	}
+	if includeLogType(logType, "p115_sync") {
+		rows, err := s.db.Query(ctx, `SELECT id, 'p115_sync', '115 STRM', status,
+			concat(trigger, ' / ', COALESCE(NULLIF(mode, ''), '-'), ' / 生成 ', generated, ' 更新 ', updated_count, ' 删除 ', deleted_count, ' 失败 ', failed),
+			event_summary, '', '', '', tree_version, '', '', '', '', '', '', '', 0, duration_ms, error_message, started_at
+			FROM p115_sync_runs ORDER BY started_at DESC LIMIT $1`, limit)
+		if err != nil {
+			return models.LogPage{}, err
+		}
+		if err := appendLogRows(rows, &entries); err != nil {
+			return models.LogPage{}, err
+		}
+	}
+	if includeLogType(logType, "operation") {
+		rows, err := s.db.Query(ctx, `SELECT id, 'operation', '整理操作', operation_status, operation_name,
+			concat(source_path, ' -> ', target_path), batch_id, file_id, '', source_path, '', '', '', '',
+			'', '', '', 0, 0, error_message, created_at
+			FROM operation_histories ORDER BY created_at DESC LIMIT $1`, limit)
+		if err != nil {
+			return models.LogPage{}, err
+		}
+		if err := appendLogRows(rows, &entries); err != nil {
+			return models.LogPage{}, err
+		}
+		rows, err = s.db.Query(ctx, `SELECT id, 'organize_task', '整理任务', task_status, template_id,
+			concat(source_path, ' -> ', target_path), batch_id, file_id, '', source_path, '', '', '', '',
+			'', '', '', 0, 0, error_message, COALESCE(executed_at, created_at)
+			FROM organize_tasks ORDER BY COALESCE(executed_at, created_at) DESC LIMIT $1`, limit)
+		if err != nil {
+			return models.LogPage{}, err
+		}
+		if err := appendLogRows(rows, &entries); err != nil {
+			return models.LogPage{}, err
+		}
+		rows, err = s.db.Query(ctx, `SELECT id, 'collection_completion', '合集补齐', 'done', collection_name,
+			concat(source_path, ' -> ', target_path, ' / ', movie_count, ' 部'), '', '', '', source_path, '', '', '', '',
+			'', '', '', 0, 0, '', created_at
+			FROM collection_completion_histories ORDER BY created_at DESC LIMIT $1`, limit)
+		if err != nil {
+			return models.LogPage{}, err
+		}
+		if err := appendLogRows(rows, &entries); err != nil {
+			return models.LogPage{}, err
+		}
+	}
+	if includeLogType(logType, "scan_batch") {
+		rows, err := s.db.Query(ctx, `SELECT id, 'scan_batch', '扫描批次', status,
+			concat(source, ' / 总数 ', total, ' 完成 ', done, ' 失败 ', failed, ' 缺失合集 ', incomplete_collection),
+			'', id, '', '', source, '', '', '', '', '', '', '', 0,
+			COALESCE((EXTRACT(EPOCH FROM (ended_at - started_at)) * 1000)::BIGINT, 0), '', started_at
+			FROM batches ORDER BY started_at DESC LIMIT $1`, limit)
+		if err != nil {
+			return models.LogPage{}, err
+		}
+		if err := appendLogRows(rows, &entries); err != nil {
+			return models.LogPage{}, err
+		}
+	}
+	sort.SliceStable(entries, func(i, j int) bool {
+		return entries[i].CreatedAt.After(entries[j].CreatedAt)
+	})
+	total := len(entries)
+	if len(entries) > limit {
+		entries = entries[:limit]
+	}
+	return models.LogPage{Items: entries, Total: total, Limit: limit, Type: logType}, nil
 }
 
 func (s *Store) ReplaceP115Snapshot(ctx context.Context, libraryCID, treeVersion string, items []models.P115TreeSnapshotItem) error {
@@ -1214,6 +1481,16 @@ func (s *Store) UpdateMediaParsed(ctx context.Context, id, parseTitle string, ye
 	return requireRows(tag.RowsAffected(), "媒体文件 "+id+" 无法流转到 "+models.StatusParsed)
 }
 
+func (s *Store) UpdateMediaParsedTV(ctx context.Context, id string, year, season, episode int) error {
+	tag, err := s.db.Exec(ctx, `UPDATE media_files SET parse_year=$2, season=$3, episode=$4, updated_at=now()
+		WHERE id=$1 AND process_status=ANY($5)`,
+		id, nullableInt(year), nullableInt(season), nullableInt(episode), []string{models.StatusParsed})
+	if err != nil {
+		return err
+	}
+	return requireRows(tag.RowsAffected(), "media file "+id+" failed to refresh parsed tv fields")
+}
+
 func (s *Store) UpdateMediaMatched(ctx context.Context, id, mediaType string) error {
 	tag, err := s.db.Exec(ctx, `UPDATE media_files SET media_type=$2, match_status='matched', process_status=$3, updated_at=now()
 		WHERE id=$1 AND process_status=ANY($4)`,
@@ -1371,7 +1648,10 @@ func (s *Store) RefreshCollectionLocalCounts(ctx context.Context) error {
 			updated_at=now()
 		FROM counts WHERE counts.tmdb_id=c.tmdb_id`,
 		models.StatusDone, models.StatusIncompleteCollection)
-	return err
+	if err != nil {
+		return err
+	}
+	return s.RefreshCuratedCollectionLocalCounts(ctx)
 }
 
 func (s *Store) ListMediaFiles(ctx context.Context, status, search string, limit, offset int) (models.MediaFilePage, error) {
@@ -1689,7 +1969,7 @@ func tvAvailabilityStatus(releasedCount, missingCount int) string {
 func (s *Store) UpsertCollection(ctx context.Context, collection models.CollectionMetadata) error {
 	_, err := s.db.Exec(ctx, `INSERT INTO collections (tmdb_id, name, overview, movie_count, unreleased_count, local_count, status, poster_path, backdrop_path)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-		ON CONFLICT (tmdb_id) DO UPDATE SET name=$2, overview=$3, movie_count=$4, unreleased_count=$5, local_count=$6, status=$7, poster_path=$8, backdrop_path=$9, updated_at=now()`,
+		ON CONFLICT (tmdb_id) DO UPDATE SET name=$2, overview=$3, movie_count=$4, unreleased_count=$5, poster_path=$8, backdrop_path=$9, updated_at=now()`,
 		collection.TMDBID, collection.Name, collection.Overview, collection.MovieCount, collection.UnreleasedCount, collection.LocalCount, collection.Status, collection.PosterPath, collection.BackdropPath)
 	return err
 }
@@ -1738,36 +2018,304 @@ func (s *Store) UpdateCollectionStatus(ctx context.Context, collectionID, localC
 	return err
 }
 
-func (s *Store) Collections(ctx context.Context, search string, limit, offset int) (models.CollectionPage, error) {
+func (s *Store) RefreshCuratedCollectionLocalCounts(ctx context.Context) error {
+	_, err := s.db.Exec(ctx, `WITH counts AS (
+			SELECT cc.id,
+				(COUNT(DISTINCT ccm.douban_id))::INT AS item_count,
+				(COUNT(DISTINCT ccm.douban_id) FILTER (WHERE ccm.movie_tmdb_id > 0))::INT AS resolved_count,
+				(COUNT(DISTINCT ccm.douban_id) FILTER (WHERE ccm.movie_tmdb_id = 0))::INT AS unresolved_count,
+				(COUNT(DISTINCT ccm.movie_tmdb_id) FILTER (
+					WHERE ccm.movie_tmdb_id > 0 AND mf.process_status IN ($1,$2)
+				))::INT AS local_count
+			FROM curated_collections cc
+			LEFT JOIN curated_collection_movies ccm ON ccm.list_id=cc.id
+			LEFT JOIN media_matches mm ON mm.movie_tmdb_id=ccm.movie_tmdb_id
+			LEFT JOIN media_files mf ON mf.id=mm.file_id
+			GROUP BY cc.id
+		)
+		UPDATE curated_collections cc SET
+			item_count=counts.item_count,
+			resolved_count=counts.resolved_count,
+			unresolved_count=counts.unresolved_count,
+			local_count=counts.local_count,
+			missing_count=GREATEST(counts.resolved_count-counts.local_count, 0),
+			status=CASE
+				WHEN counts.resolved_count > 0 AND counts.local_count >= counts.resolved_count AND counts.unresolved_count = 0 THEN 'complete'
+				ELSE 'incomplete'
+			END,
+			updated_at=now()
+		FROM counts WHERE counts.id=cc.id`, models.StatusDone, models.StatusIncompleteCollection)
+	return err
+}
+
+func (s *Store) CuratedCollectionMovieMap(ctx context.Context, listID string) (map[string]models.CollectionMovieMetadata, error) {
+	rows, err := s.db.Query(ctx, `SELECT list_id, rank, douban_id, imdb_id, movie_tmdb_id, title, original_title, year,
+		release_date, rating, poster_path, backdrop_path, source_url, match_status, error_message
+		FROM curated_collection_movies WHERE list_id=$1`, listID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := map[string]models.CollectionMovieMetadata{}
+	for rows.Next() {
+		var item models.CollectionMovieMetadata
+		if err := rows.Scan(&item.ListID, &item.SortOrder, &item.DoubanID, &item.IMDBID, &item.MovieTMDBID, &item.Title, &item.OriginalTitle,
+			&item.Year, &item.ReleaseDate, &item.Rating, &item.PosterPath, &item.BackdropPath, &item.SourceURL, &item.MatchStatus, &item.ErrorMessage); err != nil {
+			return nil, err
+		}
+		item.Released = true
+		item.Resolved = item.MovieTMDBID > 0
+		items[item.DoubanID] = item
+	}
+	return items, rows.Err()
+}
+
+func (s *Store) ReplaceCuratedCollectionMovies(ctx context.Context, listID string, items []models.CollectionMovieMetadata) error {
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	doubanIDs := make([]string, 0, len(items))
+	for _, item := range items {
+		if strings.TrimSpace(item.DoubanID) != "" {
+			doubanIDs = append(doubanIDs, item.DoubanID)
+		}
+	}
+	if len(doubanIDs) > 0 {
+		if _, err := tx.Exec(ctx, `DELETE FROM curated_collection_movies WHERE list_id=$1 AND NOT (douban_id = ANY($2))`, listID, doubanIDs); err != nil {
+			return err
+		}
+	} else if _, err := tx.Exec(ctx, `DELETE FROM curated_collection_movies WHERE list_id=$1`, listID); err != nil {
+		return err
+	}
+	for _, item := range items {
+		item.ListID = listID
+		if item.SortOrder <= 0 {
+			item.SortOrder = len(doubanIDs)
+		}
+		matchStatus := strings.TrimSpace(item.MatchStatus)
+		if matchStatus == "" {
+			if item.MovieTMDBID > 0 {
+				matchStatus = "matched"
+			} else {
+				matchStatus = "unresolved"
+			}
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO curated_collection_movies
+			(list_id, rank, douban_id, imdb_id, movie_tmdb_id, title, original_title, year, release_date, rating,
+				poster_path, backdrop_path, source_url, match_status, error_message)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+			ON CONFLICT (list_id, douban_id) DO UPDATE SET rank=$2, imdb_id=$4, movie_tmdb_id=$5, title=$6,
+				original_title=$7, year=$8, release_date=$9, rating=$10, poster_path=$11, backdrop_path=$12,
+				source_url=$13, match_status=$14, error_message=$15, updated_at=now()`,
+			listID, item.SortOrder, item.DoubanID, item.IMDBID, item.MovieTMDBID, item.Title, item.OriginalTitle,
+			item.Year, item.ReleaseDate, item.Rating, item.PosterPath, item.BackdropPath, item.SourceURL, matchStatus, item.ErrorMessage); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(ctx, `UPDATE curated_collections SET item_count=$2, refreshed_at=now(), last_refresh_error='', updated_at=now() WHERE id=$1`, listID, len(items)); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	return s.RefreshCuratedCollectionLocalCounts(ctx)
+}
+
+func (s *Store) MarkCuratedCollectionRefreshError(ctx context.Context, listID, message string) error {
+	_, err := s.db.Exec(ctx, `UPDATE curated_collections SET last_refresh_error=$2, updated_at=now() WHERE id=$1`, listID, message)
+	return err
+}
+
+func (s *Store) CompleteCollectionRepairCandidates(ctx context.Context) ([]CollectionRepairCandidate, error) {
+	rows, err := s.db.Query(ctx, `WITH stats AS (
+			SELECT c.tmdb_id, c.name, c.overview, c.movie_count, c.unreleased_count, c.poster_path, c.backdrop_path,
+				(COUNT(DISTINCT mm.movie_tmdb_id) FILTER (
+					WHERE cm.released=true AND mf.process_status IN ($1,$2)
+				))::INT AS local_count,
+				COALESCE(BOOL_OR(mf.process_status=$2), false) AS has_incomplete
+			FROM collections c
+			JOIN collection_movies cm ON cm.collection_id=c.tmdb_id
+			LEFT JOIN media_matches mm ON mm.movie_tmdb_id=cm.movie_tmdb_id
+			LEFT JOIN media_files mf ON mf.id=mm.file_id
+			GROUP BY c.tmdb_id
+		)
+		SELECT tmdb_id, name, overview, movie_count, unreleased_count, local_count, poster_path, backdrop_path
+		FROM stats
+		WHERE movie_count > 0 AND local_count >= movie_count AND has_incomplete=true`,
+		models.StatusDone, models.StatusIncompleteCollection)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	candidates := make([]CollectionRepairCandidate, 0)
+	for rows.Next() {
+		var candidate CollectionRepairCandidate
+		candidate.Collection.Status = "complete"
+		if err := rows.Scan(&candidate.Collection.TMDBID, &candidate.Collection.Name, &candidate.Collection.Overview, &candidate.Collection.MovieCount,
+			&candidate.Collection.UnreleasedCount, &candidate.Collection.LocalCount, &candidate.Collection.PosterPath, &candidate.Collection.BackdropPath); err != nil {
+			return nil, err
+		}
+		paths, err := s.IncompleteCollectionFilePaths(ctx, candidate.Collection.TMDBID)
+		if err != nil {
+			return nil, err
+		}
+		candidate.FilePaths = paths
+		candidates = append(candidates, candidate)
+	}
+	return candidates, rows.Err()
+}
+
+func (s *Store) IncompleteCollectionFilePaths(ctx context.Context, collectionID int) ([]string, error) {
+	rows, err := s.db.Query(ctx, `SELECT DISTINCT COALESCE(NULLIF(mf.final_path, ''), mf.current_path)
+		FROM media_matches mm
+		JOIN media_files mf ON mf.id=mm.file_id
+		JOIN collection_movies cm ON cm.movie_tmdb_id=mm.movie_tmdb_id
+		WHERE cm.collection_id=$1 AND mf.process_status=$2
+			AND COALESCE(NULLIF(mf.final_path, ''), mf.current_path) <> ''
+		ORDER BY 1`,
+		collectionID, models.StatusIncompleteCollection)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	paths := make([]string, 0)
+	for rows.Next() {
+		var value string
+		if err := rows.Scan(&value); err != nil {
+			return nil, err
+		}
+		paths = append(paths, value)
+	}
+	return paths, rows.Err()
+}
+
+func (s *Store) Collections(ctx context.Context, search, status string, limit, offset int) (models.CollectionPage, error) {
+	curated, err := s.CuratedCollections(ctx, search, status)
+	if err != nil {
+		return models.CollectionPage{}, err
+	}
+	tmdbTotal, err := s.tmdbCollectionCount(ctx, search, status)
+	if err != nil {
+		return models.CollectionPage{}, err
+	}
+	total := tmdbTotal + len(curated)
+	items := make([]models.CollectionMetadata, 0, limit)
+	remaining := limit
+	tmdbOffset := 0
+	if offset < len(curated) {
+		end := offset + remaining
+		if end > len(curated) {
+			end = len(curated)
+		}
+		items = append(items, curated[offset:end]...)
+		remaining -= end - offset
+	} else {
+		tmdbOffset = offset - len(curated)
+	}
+	if remaining > 0 {
+		tmdbItems, err := s.tmdbCollections(ctx, search, status, remaining, tmdbOffset)
+		if err != nil {
+			return models.CollectionPage{}, err
+		}
+		items = append(items, tmdbItems...)
+	}
+	return models.CollectionPage{Items: items, Total: total, Limit: limit, Offset: offset}, nil
+}
+
+func (s *Store) tmdbCollectionConditions(search, status string) ([]any, []string) {
 	args := []any{}
-	where := ""
+	conditions := []string{}
 	if search = strings.TrimSpace(search); search != "" {
 		args = append(args, "%"+search+"%")
-		where = fmt.Sprintf(` WHERE (name ILIKE %[1]s OR tmdb_id::TEXT ILIKE %[1]s OR overview ILIKE %[1]s OR status ILIKE %[1]s)`, fmt.Sprintf("$%d", len(args)))
+		conditions = append(conditions, fmt.Sprintf(`(name ILIKE %[1]s OR tmdb_id::TEXT ILIKE %[1]s OR overview ILIKE %[1]s OR status ILIKE %[1]s)`, fmt.Sprintf("$%d", len(args))))
+	}
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "complete":
+		conditions = append(conditions, `status='complete'`)
+	case "incomplete":
+		conditions = append(conditions, `status<>'complete'`)
+	}
+	return args, conditions
+}
+
+func (s *Store) tmdbCollectionCount(ctx context.Context, search, status string) (int, error) {
+	args, conditions := s.tmdbCollectionConditions(search, status)
+	where := ""
+	if len(conditions) > 0 {
+		where = ` WHERE ` + strings.Join(conditions, " AND ")
 	}
 	var total int
 	if err := s.db.QueryRow(ctx, `SELECT COUNT(*)::INT FROM collections`+where, args...).Scan(&total); err != nil {
-		return models.CollectionPage{}, err
+		return 0, err
+	}
+	return total, nil
+}
+
+func (s *Store) tmdbCollections(ctx context.Context, search, status string, limit, offset int) ([]models.CollectionMetadata, error) {
+	args, conditions := s.tmdbCollectionConditions(search, status)
+	where := ""
+	if len(conditions) > 0 {
+		where = ` WHERE ` + strings.Join(conditions, " AND ")
 	}
 	args = append(args, limit, offset)
 	rows, err := s.db.Query(ctx, fmt.Sprintf(`SELECT tmdb_id, name, overview, movie_count, unreleased_count, local_count, status, poster_path, backdrop_path
 		FROM collections%s ORDER BY updated_at DESC LIMIT $%d OFFSET $%d`, where, len(args)-1, len(args)), args...)
 	if err != nil {
-		return models.CollectionPage{}, err
+		return nil, err
 	}
 	defer rows.Close()
 	collections := make([]models.CollectionMetadata, 0)
 	for rows.Next() {
 		var c models.CollectionMetadata
 		if err := rows.Scan(&c.TMDBID, &c.Name, &c.Overview, &c.MovieCount, &c.UnreleasedCount, &c.LocalCount, &c.Status, &c.PosterPath, &c.BackdropPath); err != nil {
-			return models.CollectionPage{}, err
+			return nil, err
 		}
+		c.ID = fmt.Sprintf("%d", c.TMDBID)
+		c.Kind = models.CollectionKindTMDB
 		collections = append(collections, c)
 	}
 	if err := rows.Err(); err != nil {
-		return models.CollectionPage{}, err
+		return nil, err
 	}
-	return models.CollectionPage{Items: collections, Total: total, Limit: limit, Offset: offset}, nil
+	return collections, nil
+}
+
+func (s *Store) CuratedCollections(ctx context.Context, search, status string) ([]models.CollectionMetadata, error) {
+	args := []any{}
+	conditions := []string{}
+	if search = strings.TrimSpace(search); search != "" {
+		args = append(args, "%"+search+"%")
+		conditions = append(conditions, fmt.Sprintf(`(id ILIKE %[1]s OR source ILIKE %[1]s OR name ILIKE %[1]s OR overview ILIKE %[1]s OR status ILIKE %[1]s)`, fmt.Sprintf("$%d", len(args))))
+	}
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "complete":
+		conditions = append(conditions, `status='complete'`)
+	case "incomplete":
+		conditions = append(conditions, `status<>'complete'`)
+	}
+	where := ""
+	if len(conditions) > 0 {
+		where = ` WHERE ` + strings.Join(conditions, " AND ")
+	}
+	rows, err := s.db.Query(ctx, `SELECT id, source, name, overview, source_url, item_count, unresolved_count,
+		local_count, status, poster_path, backdrop_path, refreshed_at, last_refresh_error
+		FROM curated_collections`+where+`
+		ORDER BY CASE WHEN id=$`+fmt.Sprint(len(args)+1)+` THEN 0 ELSE 1 END, updated_at DESC`, append(args, models.CuratedDoubanTop250ID)...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := make([]models.CollectionMetadata, 0)
+	for rows.Next() {
+		item, err := scanCuratedCollection(rows)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
 }
 
 func (s *Store) Collection(ctx context.Context, id int) (models.CollectionMetadata, error) {
@@ -1777,12 +2325,30 @@ func (s *Store) Collection(ctx context.Context, id int) (models.CollectionMetada
 	if err != nil {
 		return models.CollectionMetadata{}, err
 	}
+	c.ID = fmt.Sprintf("%d", c.TMDBID)
+	c.Kind = models.CollectionKindTMDB
 	parts, err := s.CollectionMovies(ctx, id)
 	if err != nil {
 		return models.CollectionMetadata{}, err
 	}
 	c.Parts = parts
 	return c, nil
+}
+
+func (s *Store) CuratedCollection(ctx context.Context, id string) (models.CollectionMetadata, error) {
+	row := s.db.QueryRow(ctx, `SELECT id, source, name, overview, source_url, item_count, unresolved_count,
+		local_count, status, poster_path, backdrop_path, refreshed_at, last_refresh_error
+		FROM curated_collections WHERE id=$1`, id)
+	collection, err := scanCuratedCollection(row)
+	if err != nil {
+		return models.CollectionMetadata{}, err
+	}
+	parts, err := s.CuratedCollectionMovies(ctx, id)
+	if err != nil {
+		return models.CollectionMetadata{}, err
+	}
+	collection.Parts = parts
+	return collection, nil
 }
 
 func (s *Store) CollectionMovies(ctx context.Context, collectionID int) ([]models.CollectionMovieMetadata, error) {
@@ -1811,9 +2377,66 @@ func (s *Store) CollectionMovies(ctx context.Context, collectionID int) ([]model
 			return nil, err
 		}
 		item.Local = item.FileID != ""
+		item.Resolved = item.MovieTMDBID > 0
 		parts = append(parts, item)
 	}
 	return parts, rows.Err()
+}
+
+func (s *Store) CuratedCollectionMovies(ctx context.Context, listID string) ([]models.CollectionMovieMetadata, error) {
+	rows, err := s.db.Query(ctx, `SELECT ccm.list_id, ccm.rank, ccm.douban_id, ccm.imdb_id, ccm.movie_tmdb_id,
+		ccm.title, ccm.original_title, ccm.year, ccm.release_date, ccm.rating, ccm.poster_path, ccm.backdrop_path,
+		ccm.source_url, ccm.match_status, ccm.error_message,
+		COALESCE(local.file_id, ''), COALESCE(local.file_path, ''), COALESCE(local.process_status, '')
+		FROM curated_collection_movies ccm
+		LEFT JOIN LATERAL (
+			SELECT mf.id AS file_id, COALESCE(NULLIF(mf.final_path, ''), mf.current_path) AS file_path, mf.process_status
+			FROM media_matches mm
+			JOIN media_files mf ON mf.id=mm.file_id
+			WHERE ccm.movie_tmdb_id > 0 AND mm.movie_tmdb_id=ccm.movie_tmdb_id AND mf.process_status IN ($2,$3)
+			ORDER BY mf.updated_at DESC
+			LIMIT 1
+		) local ON true
+		WHERE ccm.list_id=$1
+		ORDER BY ccm.rank, ccm.year, ccm.title`, listID, models.StatusDone, models.StatusIncompleteCollection)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	parts := make([]models.CollectionMovieMetadata, 0)
+	for rows.Next() {
+		var item models.CollectionMovieMetadata
+		if err := rows.Scan(&item.ListID, &item.SortOrder, &item.DoubanID, &item.IMDBID, &item.MovieTMDBID,
+			&item.Title, &item.OriginalTitle, &item.Year, &item.ReleaseDate, &item.Rating, &item.PosterPath, &item.BackdropPath,
+			&item.SourceURL, &item.MatchStatus, &item.ErrorMessage, &item.FileID, &item.FilePath, &item.ProcessStatus); err != nil {
+			return nil, err
+		}
+		item.Released = true
+		item.Resolved = item.MovieTMDBID > 0
+		item.Local = item.FileID != ""
+		parts = append(parts, item)
+	}
+	return parts, rows.Err()
+}
+
+type scanRow interface {
+	Scan(dest ...any) error
+}
+
+func scanCuratedCollection(row scanRow) (models.CollectionMetadata, error) {
+	var c models.CollectionMetadata
+	var refreshedAt sql.NullTime
+	err := row.Scan(&c.ID, &c.Source, &c.Name, &c.Overview, &c.SourceURL, &c.MovieCount, &c.UnresolvedCount,
+		&c.LocalCount, &c.Status, &c.PosterPath, &c.BackdropPath, &refreshedAt, &c.LastRefreshError)
+	if err != nil {
+		return models.CollectionMetadata{}, err
+	}
+	c.Kind = models.CollectionKindCurated
+	c.UnreleasedCount = c.UnresolvedCount
+	if refreshedAt.Valid {
+		c.LastRefreshedAt = &refreshedAt.Time
+	}
+	return c, nil
 }
 
 func (s *Store) CreateTask(ctx context.Context, id, fileID, batchID, templateID, sourcePath, targetPath, status string) error {
@@ -1839,17 +2462,36 @@ func (s *Store) AddCollectionCompletionHistory(ctx context.Context, id string, c
 	return err
 }
 
-func (s *Store) UpdateCollectionPathPrefix(ctx context.Context, collectionID int, sourcePrefix, targetPrefix string) error {
-	_, err := s.db.Exec(ctx, `UPDATE media_files mf SET
-			current_path=replace(current_path, $2, $3),
-			final_path=replace(final_path, $2, $3),
-			process_status=$4,
-			updated_at=now()
-		FROM media_matches mm
-		JOIN collection_movies cm ON cm.movie_tmdb_id=mm.movie_tmdb_id
-		WHERE mf.id=mm.file_id AND cm.collection_id=$1 AND mf.process_status=$5`,
+func (s *Store) UpdateCollectionPathPrefix(ctx context.Context, collectionID int, sourcePrefix, targetPrefix string) ([]string, error) {
+	rows, err := s.db.Query(ctx, `WITH updated AS (
+			UPDATE media_files mf SET
+				current_path=replace(current_path, $2, $3),
+				final_path=replace(final_path, $2, $3),
+				last_verified_path=replace(last_verified_path, $2, $3),
+				process_status=$4,
+				updated_at=now()
+			FROM media_matches mm
+			JOIN collection_movies cm ON cm.movie_tmdb_id=mm.movie_tmdb_id
+			WHERE mf.id=mm.file_id AND cm.collection_id=$1 AND mf.process_status=$5
+			RETURNING mf.batch_id
+		)
+		SELECT DISTINCT batch_id FROM updated`,
 		collectionID, sourcePrefix, targetPrefix, models.StatusDone, models.StatusIncompleteCollection)
-	return err
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	batchIDs := make([]string, 0)
+	for rows.Next() {
+		var batchID string
+		if err := rows.Scan(&batchID); err != nil {
+			return nil, err
+		}
+		if batchID != "" {
+			batchIDs = append(batchIDs, batchID)
+		}
+	}
+	return batchIDs, rows.Err()
 }
 
 func scanBatch(rows pgx.Rows) (models.Batch, error) {
@@ -1860,6 +2502,34 @@ func scanBatch(rows pgx.Rows) (models.Batch, error) {
 		batch.EndedAt = &ended.Time
 	}
 	return batch, err
+}
+
+func appendLogRows(rows pgx.Rows, entries *[]models.LogEntry) error {
+	defer rows.Close()
+	for rows.Next() {
+		var entry models.LogEntry
+		if err := rows.Scan(&entry.ID, &entry.Type, &entry.Source, &entry.Status, &entry.Message, &entry.Detail,
+			&entry.BatchID, &entry.FileID, &entry.FileName, &entry.Path, &entry.Model, &entry.BaseURL, &entry.ProxyURL,
+			&entry.ResponseFormat, &entry.RequestJSON, &entry.ResponseJSON, &entry.ParsedJSON, &entry.HTTPStatus,
+			&entry.DurationMS, &entry.ErrorMessage, &entry.CreatedAt); err != nil {
+			return err
+		}
+		*entries = append(*entries, entry)
+	}
+	return rows.Err()
+}
+
+func includeLogType(filter, kind string) bool {
+	switch filter {
+	case "", "all":
+		return true
+	case "operation":
+		return kind == "operation"
+	case "scan":
+		return kind == "scan_batch"
+	default:
+		return filter == kind
+	}
 }
 
 func scanMediaFile(rows pgx.Rows) (models.MediaFile, error) {
@@ -1874,11 +2544,16 @@ func scanMediaFile(rows pgx.Rows) (models.MediaFile, error) {
 func scanSTRMLink(rows pgx.Rows) (models.STRMLink, error) {
 	var link models.STRMLink
 	var resolved sql.NullTime
+	var mediaProbed sql.NullTime
 	err := rows.Scan(&link.ID, &link.Provider, &link.LibraryCID, &link.LibraryName, &link.LibraryType, &link.RelativePath, &link.RemotePath,
 		&link.RemoteFileID, &link.PickCode, &link.SHA1, &link.Size, &link.STRMPath, &link.PlayPath, &link.SourceTreeHash, &link.TreeVersion,
-		&link.ResolveStatus, &link.Status, &link.ErrorCode, &link.ErrorMessage, &link.GeneratedAt, &resolved, &link.UpdatedAt)
+		&link.ResolveStatus, &link.Status, &link.ErrorCode, &link.ErrorMessage, &link.MediaStreams, &link.MediaDurationTicks, &mediaProbed, &link.MediaProbeError,
+		&link.GeneratedAt, &resolved, &link.UpdatedAt)
 	if resolved.Valid {
 		link.ResolvedAt = &resolved.Time
+	}
+	if mediaProbed.Valid {
+		link.MediaProbedAt = &mediaProbed.Time
 	}
 	return link, err
 }
@@ -1887,7 +2562,7 @@ func scanP115SyncRun(rows pgx.Rows) (models.P115SyncRun, error) {
 	var run models.P115SyncRun
 	var ended sql.NullTime
 	err := rows.Scan(&run.ID, &run.Trigger, &run.Status, &run.Mode, &run.TreeVersion, &run.Exported, &run.Generated, &run.Restored,
-		&run.Updated, &run.Deleted, &run.Skipped, &run.Failed, &run.ErrorMessage, &run.StartedAt, &ended, &run.DurationMS)
+		&run.Updated, &run.Deleted, &run.Skipped, &run.Failed, &run.ErrorMessage, &run.EventSummary, &run.StartedAt, &ended, &run.DurationMS)
 	if ended.Valid {
 		run.EndedAt = &ended.Time
 	}

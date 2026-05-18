@@ -37,7 +37,7 @@ services:
       retries: 20
 
   curio:
-    image: mon3trd/curio:1.0.2
+    image: mon3trd/curio:1.0.3
     container_name: curio
     user: "0:0"
     restart: unless-stopped

@@ -1,6 +1,8 @@
 package p115
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -59,6 +61,109 @@ func TestDirectURLTTLUpgradesLegacyDefault(t *testing.T) {
 	}
 }
 
+func TestWriteSTRMSkipsUnchangedContent(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "movie.strm")
+
+	wrote, err := writeSTRM(root, target, "http://localhost/play")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !wrote {
+		t.Fatal("expected first write")
+	}
+
+	wrote, err = writeSTRM(root, target, "http://localhost/play")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wrote {
+		t.Fatal("expected unchanged STRM to be skipped")
+	}
+}
+
+func TestLocalSTRMFilesFindsOnlySTRMUnderOutputPrefix(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "media", "movies"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(root, "media", "movies", "A.strm")
+	if err := os.WriteFile(want, []byte("http://localhost/play\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "media", "movies", "A.nfo"), []byte("nfo"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	files, err := localSTRMFiles(root, "media")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 || files[cleanPathKey(want)] != want {
+		t.Fatalf("unexpected STRM files %#v", files)
+	}
+}
+
+func TestDesiredSTRMRelativePathsUsesMediaPathWithoutExportRoot(t *testing.T) {
+	items := []TreeItem{
+		{RelativePath: "tv/A.mkv", Name: "A.mkv"},
+		{RelativePath: "movies/B.mp4", Name: "B.mp4"},
+		{RelativePath: "tv", Name: "tv", IsDirectory: true},
+	}
+
+	got := strings.Join(desiredSTRMRelativePaths(items), "|")
+	want := "tv/A.strm|movies/B.strm"
+	if got != want {
+		t.Fatalf("unexpected STRM paths %q", got)
+	}
+}
+
+func TestLocalSTRMRelativePathsReturnsPathsUnderOutputPrefix(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "prefix", "tv", "A.strm")
+
+	got := localSTRMRelativePaths(root, "prefix", map[string]string{
+		cleanPathKey(target): target,
+	})
+
+	if len(got) != 1 || got[0] != "tv/A.strm" {
+		t.Fatalf("unexpected local STRM relative paths %#v", got)
+	}
+}
+
+func TestDetectRelativePrefixShiftCatchesAddedExportRoot(t *testing.T) {
+	prefix, matched, total, ok := detectRelativePrefixShift(
+		[]string{"tv/A.mkv", "movies/B.mkv", "collections/C.mkv"},
+		[]string{"media/tv/A.mkv", "media/movies/B.mkv", "media/collections/C.mkv"},
+	)
+
+	if !ok || prefix != "media" || matched != 3 || total != 3 {
+		t.Fatalf("expected media prefix shift, got prefix=%q matched=%d total=%d ok=%t", prefix, matched, total, ok)
+	}
+}
+
+func TestDetectRelativePrefixShiftIgnoresUnchangedPaths(t *testing.T) {
+	_, _, _, ok := detectRelativePrefixShift(
+		[]string{"tv/A.mkv", "movies/B.mkv"},
+		[]string{"tv/A.mkv", "movies/B.mkv"},
+	)
+
+	if ok {
+		t.Fatal("unchanged paths must not look like a prefix shift")
+	}
+}
+
+func TestDetectRelativePrefixShiftIgnoresUnrelatedChanges(t *testing.T) {
+	_, _, _, ok := detectRelativePrefixShift(
+		[]string{"tv/A.mkv", "movies/B.mkv", "collections/C.mkv"},
+		[]string{"tv/A-renamed.mkv", "movies/B.mkv", "extras/C.mkv"},
+	)
+
+	if ok {
+		t.Fatal("unrelated changes must not look like a prefix shift")
+	}
+}
+
 func TestApplyLifeEventsUpdatesNodeTree(t *testing.T) {
 	lib := LibraryConfig{CID: "root"}
 	nodes := []models.P115Node{
@@ -99,13 +204,44 @@ func TestApplyLifeEventsDeletesDirectoryDescendants(t *testing.T) {
 	}
 }
 
-func TestDirectoryMoveEventStaysIncremental(t *testing.T) {
+func TestDirectoryMoveEventNeedsSubtreeScan(t *testing.T) {
 	events := []LifeEvent{{ID: 1, Type: 6, FileID: "dir-1", ParentID: "root", Name: "tv"}}
-	if eventsNeedTreeScan(events) {
-		t.Fatal("expected directory-like move event to stay incremental")
+	if !eventsNeedTreeScan(events) {
+		t.Fatal("expected directory-like move event to trigger subtree scan")
 	}
 	if !eventCreatesDirectory(events[0]) {
 		t.Fatal("expected directory-like move event to create a directory node")
+	}
+}
+
+func TestMoveFileFolderNameWithMetadataStillLooksDirectory(t *testing.T) {
+	event := LifeEvent{ID: 1, Type: 6, FileID: "dir-1", ParentID: "root", Name: "雷神（系列）", PickCode: "pc-dir", SHA1: "sha-dir", Size: 4}
+	if !eventCreatesDirectory(event) {
+		t.Fatal("expected folder-like move_file event with metadata to be treated as directory candidate")
+	}
+	if !eventsNeedParentDirectoryReconcile(nil, []LifeEvent{event}) {
+		t.Fatal("expected folder-like move_file event to trigger parent directory reconcile")
+	}
+}
+
+func TestNewMovedDirectoryEventNeedsLibraryReconcile(t *testing.T) {
+	events := []LifeEvent{{ID: 1, Type: 6, FileID: "dir-1", ParentID: "root", Name: "独立日（系列）"}}
+	if !eventsNeedParentDirectoryReconcile(nil, events) {
+		t.Fatal("expected new moved directory to trigger parent directory reconcile")
+	}
+	nodes := []models.P115Node{{LibraryCID: "root", RemoteFileID: "dir-1", ParentFileID: "root", RelativePath: "独立日（系列）", Name: "独立日（系列）", IsDirectory: true, IsAlive: true}}
+	if eventsNeedParentDirectoryReconcile(nodes, events) {
+		t.Fatal("expected known moved directory to stay on subtree/path incremental path")
+	}
+}
+
+func TestReceiveFilesDirectoryEventNeedsLibraryReconcile(t *testing.T) {
+	events := []LifeEvent{{ID: 1, Type: 14, FileID: "dir-1", ParentID: "root", Name: "环太平洋（系列）"}}
+	if !eventCreatesDirectory(events[0]) {
+		t.Fatal("expected receive_files folder-like event to be treated as directory")
+	}
+	if !eventsNeedParentDirectoryReconcile(nil, events) {
+		t.Fatal("expected receive_files folder-like event to trigger parent directory reconcile")
 	}
 }
 
@@ -116,12 +252,153 @@ func TestEventsNeedTreeScanKeepsNormalVideoEventIncremental(t *testing.T) {
 	}
 }
 
+func TestEventsNeedTreeScanKeepsSubtitleEventFileLike(t *testing.T) {
+	events := []LifeEvent{{ID: 1, Type: 6, FileID: "sub-1", ParentID: "root", Name: "甜心格格 - S05E01.ass"}}
+	if eventsNeedTreeScan(events) {
+		t.Fatal("expected subtitle move event to stay file-like")
+	}
+}
+
 func TestAdvanceCursorWithBatchUsesRawHighWater(t *testing.T) {
 	cursor := models.P115EventCursor{LibraryCID: "root", LastEventID: 10, LastEventTime: 1000}
 	next := advanceCursorWithBatch(cursor, LifeEventBatch{LastEventID: 20, LastEventTime: 2000})
 
 	if next.LastEventID != 20 || next.LastEventTime != 2000 {
 		t.Fatalf("expected raw event cursor to advance, got %#v", next)
+	}
+}
+
+func TestPathOnlyExportDoesNotLookLikeAuthoritativeNodes(t *testing.T) {
+	lib := LibraryConfig{CID: "root"}
+	items := []TreeItem{
+		{RelativePath: "电影/示例.mkv", Name: "示例.mkv"},
+		{RelativePath: "电影", Name: "电影", IsDirectory: true},
+	}
+
+	if treeItemsHaveRemoteIdentity(items) {
+		t.Fatal("path-only exported tree must not replace the node cache")
+	}
+	if nodes := nodesFromTreeItems(lib, items, "v1"); len(nodes) != 0 {
+		t.Fatalf("expected no authoritative nodes, got %#v", nodes)
+	}
+}
+
+func TestRemoteIdentityTreeCanReplaceNodes(t *testing.T) {
+	items := []TreeItem{{RelativePath: "电影/示例.mkv", Name: "示例.mkv", RemoteFileID: "file-1", ParentFileID: "dir-1", PickCode: "pc1"}}
+
+	if !treeItemsHaveRemoteIdentity(items) {
+		t.Fatal("tree with remote file ids should be authoritative for node cache")
+	}
+}
+
+func TestCanMarkMissingOnlyForAuthoritativeSources(t *testing.T) {
+	for _, mode := range []string{"export"} {
+		if !canMarkMissingFromSource(mode) {
+			t.Fatalf("expected %s to allow missing STRM marking", mode)
+		}
+	}
+	for _, mode := range []string{"events", "events_parent_scan", "scan", "rebuild_nodes", "cache", "snapshot", "", "sync"} {
+		if canMarkMissingFromSource(mode) {
+			t.Fatalf("expected %s to preserve existing STRM links", mode)
+		}
+	}
+}
+
+func TestMovedDirectorySubtreeScanAddsChildren(t *testing.T) {
+	lib := LibraryConfig{CID: "root"}
+	events := []LifeEvent{{ID: 1, Type: 6, FileID: "dir-1", ParentID: "root", Name: "独立日（系列）"}}
+	updated, changed := applyLifeEventsToNodes(lib, nil, events, "v2")
+	if !changed {
+		t.Fatal("expected directory event to create root node")
+	}
+	roots := eventSubtreeScanRoots(updated, events)
+	if len(roots) != 1 || roots[0].RemoteFileID != "dir-1" {
+		t.Fatalf("expected one subtree scan root, got %#v", roots)
+	}
+	merged, changed := mergeScannedSubtree(lib, updated, roots[0], []TreeItem{
+		{RelativePath: "独立日（系列）/独立日.mkv", Name: "独立日.mkv", RemoteFileID: "file-1", ParentFileID: "dir-1", PickCode: "pc1", SHA1: "sha1", Size: 10},
+	}, "v2")
+	if !changed {
+		t.Fatal("expected scanned child to change node cache")
+	}
+	items := treeItemsFromNodes(aliveNodes(merged))
+	paths := make(map[string]TreeItem, len(items))
+	for _, item := range items {
+		paths[item.RelativePath] = item
+	}
+	if !paths["独立日（系列）"].IsDirectory {
+		t.Fatalf("expected moved root directory in %#v", items)
+	}
+	if !isMediaTreeItem(paths["独立日（系列）/独立日.mkv"]) {
+		t.Fatalf("expected scanned media child in %#v", items)
+	}
+}
+
+func TestParentDirectoryReconcileReplacesSyntheticFolderID(t *testing.T) {
+	lib := LibraryConfig{CID: "root"}
+	event := LifeEvent{ID: 1, Type: 6, FileID: "event-dir", ParentID: "root", Name: "雷神（系列）"}
+	nodes, changed := applyLifeEventsToNodes(lib, nil, []LifeEvent{event}, "v2")
+	if !changed {
+		t.Fatal("expected synthetic event directory")
+	}
+	actualRoot := models.P115Node{
+		LibraryCID:   "root",
+		TreeVersion:  "v2",
+		RemoteFileID: "actual-dir",
+		ParentFileID: "root",
+		RelativePath: "雷神（系列）",
+		Name:         "雷神（系列）",
+		IsDirectory:  true,
+		IsAlive:      true,
+	}
+	nodes, changed = markSupersededEventDirectory(nodes, event, "v2")
+	if !changed {
+		t.Fatal("expected synthetic event directory to be marked dead")
+	}
+	nodes, changed = mergeScannedSubtree(lib, nodes, actualRoot, []TreeItem{
+		{RelativePath: "雷神（系列）/雷神.mkv", Name: "雷神.mkv", RemoteFileID: "file-1", ParentFileID: "actual-dir", PickCode: "pc1", SHA1: "sha1", Size: 10},
+	}, "v2")
+	if !changed {
+		t.Fatal("expected actual scanned directory to be merged")
+	}
+	items := treeItemsFromNodes(aliveNodes(nodes))
+	paths := make(map[string]TreeItem, len(items))
+	for _, item := range items {
+		paths[item.RelativePath] = item
+		if item.RemoteFileID == "event-dir" {
+			t.Fatalf("synthetic event directory should not stay alive: %#v", items)
+		}
+	}
+	if !paths["雷神（系列）"].IsDirectory || paths["雷神（系列）"].RemoteFileID != "actual-dir" {
+		t.Fatalf("expected actual root directory, got %#v", items)
+	}
+	if !isMediaTreeItem(paths["雷神（系列）/雷神.mkv"]) {
+		t.Fatalf("expected scanned child media, got %#v", items)
+	}
+}
+
+func TestMergeScannedSubtreeMarksMissingDescendantsDead(t *testing.T) {
+	lib := LibraryConfig{CID: "root"}
+	nodes := []models.P115Node{
+		{LibraryCID: "root", RemoteFileID: "dir-1", ParentFileID: "root", RelativePath: "tv", Name: "tv", IsDirectory: true, IsAlive: true},
+		{LibraryCID: "root", RemoteFileID: "file-old", ParentFileID: "dir-1", RelativePath: "tv/old.mkv", Name: "old.mkv", PickCode: "old", SHA1: "oldsha", Size: 10, IsAlive: true, IsMedia: true},
+	}
+	merged, changed := mergeScannedSubtree(lib, nodes, nodes[0], []TreeItem{
+		{RelativePath: "tv/new.mkv", Name: "new.mkv", RemoteFileID: "file-new", ParentFileID: "dir-1", PickCode: "new", SHA1: "newsha", Size: 20},
+	}, "v2")
+	if !changed {
+		t.Fatal("expected subtree merge to change node cache")
+	}
+	alive := treeItemsFromNodes(aliveNodes(merged))
+	paths := make(map[string]bool, len(alive))
+	for _, item := range alive {
+		paths[item.RelativePath] = true
+	}
+	if paths["tv/old.mkv"] {
+		t.Fatalf("expected old descendant to be marked dead, got %#v", alive)
+	}
+	if !paths["tv/new.mkv"] {
+		t.Fatalf("expected new descendant, got %#v", alive)
 	}
 }
 

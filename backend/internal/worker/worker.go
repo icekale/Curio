@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -16,6 +17,7 @@ import (
 	"time"
 	"unicode"
 
+	"curio/internal/aifilename"
 	"curio/internal/classifier"
 	"curio/internal/clouddrive"
 	"curio/internal/collection"
@@ -55,6 +57,8 @@ type RearchiveOptions struct {
 	Episode       int
 	SeasonOffset  int
 	EpisodeOffset int
+	SourcePath    string
+	TargetRoot    string
 }
 
 type RearchiveFailure struct {
@@ -100,7 +104,7 @@ func (s *Service) StartScan(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	go s.runBatch(runCtx, batchID, dirs, settings.ClassificationYAML)
+	go s.runBatch(runCtx, batchID, dirs, settings)
 	return batchID, nil
 }
 
@@ -120,7 +124,7 @@ func (s *Service) StartCloudDriveScan(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	go s.runCloudDriveBatch(runCtx, batchID, settings, systemSettings.ClassificationYAML)
+	go s.runCloudDriveBatch(runCtx, batchID, settings, systemSettings)
 	return batchID, nil
 }
 
@@ -253,7 +257,7 @@ func (s *Service) RearchiveMedia(ctx context.Context, fileID string, options Rea
 	if file.ProcessStatus != models.StatusFailed && file.ProcessStatus != models.StatusDone && file.ProcessStatus != models.StatusIncompleteCollection {
 		return models.MediaFile{}, errors.New("仅支持失败或已归档记录重新归档")
 	}
-	sourcePath := mediaSourcePath(file)
+	sourcePath := rearchiveSourcePath(file, options.SourcePath)
 	if sourcePath == "" {
 		return models.MediaFile{}, errors.New("媒体文件缺少可移动路径")
 	}
@@ -267,6 +271,9 @@ func (s *Service) RearchiveMedia(ctx context.Context, fileID string, options Rea
 	}
 	dirs, err := s.rearchiveDirs(ctx, file)
 	if err != nil {
+		return models.MediaFile{}, err
+	}
+	if err := applyRearchiveTargetRoot(&dirs, file, options.TargetRoot); err != nil {
 		return models.MediaFile{}, err
 	}
 	systemSettings, err := s.store.Settings(ctx)
@@ -296,7 +303,6 @@ func (s *Service) RearchiveMedia(ctx context.Context, fileID string, options Rea
 	templateType := result.MediaType
 	root := dirs.StagingPath
 	finalStatus := models.StatusDone
-	completeCollection := false
 	values := namingValues(parsed, technical, result)
 	category, err := classifier.Match(systemSettings.ClassificationYAML, result.MediaType, classifierItem(result))
 	if err != nil {
@@ -313,7 +319,6 @@ func (s *Service) RearchiveMedia(ctx context.Context, fileID string, options Rea
 		status := "incomplete"
 		if check.Complete {
 			status = "complete"
-			completeCollection = true
 		}
 		_ = s.store.UpdateCollectionStatus(ctx, result.Collection.TMDBID, check.LocalCount, status)
 		if !check.Complete {
@@ -343,6 +348,11 @@ func (s *Service) RearchiveMedia(ctx context.Context, fileID string, options Rea
 		return models.MediaFile{}, err
 	}
 	cloudSource := clouddrive.IsURI(file.CurrentPath)
+	sourceDir := filepath.Dir(file.CurrentPath)
+	if cloudSource {
+		sourceDir = path.Dir(clouddrive.FromURI(file.CurrentPath))
+	}
+	sidecars := s.findRearchiveSidecars(ctx, file, cloudSource, drive)
 	if !cloudSource {
 		if _, err := os.Stat(targetPath); err == nil && filepath.Clean(file.CurrentPath) != filepath.Clean(targetPath) {
 			return models.MediaFile{}, errors.New(models.ErrTargetPathExists)
@@ -377,15 +387,13 @@ func (s *Service) RearchiveMedia(ctx context.Context, fileID string, options Rea
 		return models.MediaFile{}, err
 	}
 	_ = s.store.AddHistory(ctx, uuid.NewString(), "", file.ID, file.BatchID, file.CurrentPath, movedPath, "manual_rearchive", finalStatus, "", "")
+	if err := s.moveSidecars(ctx, file, "", sidecars, targetPath, cloudSource, drive); err != nil {
+		_ = s.store.AddHistory(ctx, uuid.NewString(), "", file.ID, file.BatchID, file.CurrentPath, targetPath, "subtitle_move", models.StatusFailed, models.ErrSubtitleMoveFailed, err.Error())
+	}
+	s.cleanupEmptyParents(ctx, dirs, sourceDir, sidecars, cloudSource, drive)
 	_ = s.store.RecountBatch(ctx, file.BatchID)
 	_ = s.store.RefreshCollectionLocalCounts(ctx)
-	if completeCollection {
-		if cloudSource {
-			s.migrateCompleteCloudCollection(ctx, dirs, result, values)
-		} else {
-			s.migrateCompleteCollection(ctx, dirs, result, values)
-		}
-	}
+	s.reconcileCompleteCollection(ctx, dirs, result, values, cloudSource)
 	return s.store.MediaFile(ctx, file.ID)
 }
 
@@ -410,7 +418,74 @@ func (s *Service) Recover(ctx context.Context) error {
 	).Err()
 }
 
-func (s *Service) runBatch(ctx context.Context, batchID string, dirs models.DirectoryConfig, classificationYAML string) {
+func (s *Service) RepairCompleteCollections(ctx context.Context) (int, error) {
+	if err := s.store.RefreshCollectionLocalCounts(ctx); err != nil {
+		return 0, err
+	}
+	candidates, err := s.store.CompleteCollectionRepairCandidates(ctx)
+	if err != nil {
+		return 0, err
+	}
+	repaired := 0
+	var firstErr error
+	for _, candidate := range candidates {
+		if err := ctx.Err(); err != nil {
+			return repaired, err
+		}
+		if len(candidate.FilePaths) == 0 {
+			continue
+		}
+		if err := s.repairCompleteCollection(ctx, candidate); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		repaired++
+	}
+	return repaired, firstErr
+}
+
+func (s *Service) repairCompleteCollection(ctx context.Context, candidate repository.CollectionRepairCandidate) error {
+	cloudSource := clouddrive.IsURI(candidate.FilePaths[0])
+	var dirs models.DirectoryConfig
+	var err error
+	if cloudSource {
+		settings, settingsErr := s.store.CloudDriveSettings(ctx)
+		if settingsErr != nil {
+			return settingsErr
+		}
+		dirs = cloudDriveDirs(settings)
+	} else {
+		dirs, err = s.store.Directories(ctx)
+		if err != nil {
+			return err
+		}
+	}
+	sourceRoot := repairCollectionSourceRoot(candidate.FilePaths, dirs.IncompleteCollectionsPath, cloudSource)
+	if strings.TrimSpace(sourceRoot) == "" {
+		return nil
+	}
+	values := repairCollectionValues(candidate.Collection, sourceRoot, dirs.IncompleteCollectionsPath, cloudSource)
+	collectionTemplate, err := s.store.Template(ctx, models.TemplateCollectionMovie)
+	if err != nil {
+		return err
+	}
+	collectionRenderTemplate := templateWithImplicitCategory(collectionTemplate.Template, values)
+	targetRoot, err := naming.CollectionRoot(collectionRenderTemplate, values, dirs.StagingPath)
+	if err != nil {
+		return err
+	}
+	return s.withLock(ctx, fmt.Sprintf("lock:collection:%d", candidate.Collection.TMDBID), time.Minute, func() error {
+		_ = s.store.UpdateCollectionStatus(ctx, candidate.Collection.TMDBID, candidate.Collection.LocalCount, "complete")
+		if cloudSource {
+			return s.moveCompleteCloudCollection(ctx, candidate.Collection, sourceRoot, targetRoot)
+		}
+		return s.moveCompleteCollection(ctx, candidate.Collection, sourceRoot, targetRoot)
+	})
+}
+
+func (s *Service) runBatch(ctx context.Context, batchID string, dirs models.DirectoryConfig, settings models.SystemSettings) {
 	defer s.finishActive(batchID)
 	err := s.runSafely(batchID, func() error {
 		return s.withQueue(ctx, "queue:scan", batchID, func() error {
@@ -423,7 +498,7 @@ func (s *Service) runBatch(ctx context.Context, batchID string, dirs models.Dire
 			}
 			_ = s.store.SetBatchTotal(ctx, batchID, len(files))
 			_ = s.progress(ctx, batchID)
-			if err := s.processFiles(ctx, batchID, dirs, files, classificationYAML, nil); err != nil {
+			if err := s.processFiles(ctx, batchID, dirs, files, settings, nil); err != nil {
 				return err
 			}
 			return s.progress(ctx, batchID)
@@ -432,7 +507,7 @@ func (s *Service) runBatch(ctx context.Context, batchID string, dirs models.Dire
 	s.finishBatch(ctx, batchID, err)
 }
 
-func (s *Service) runCloudDriveBatch(ctx context.Context, batchID string, settings models.CloudDriveSettings, classificationYAML string) {
+func (s *Service) runCloudDriveBatch(ctx context.Context, batchID string, settings models.CloudDriveSettings, systemSettings models.SystemSettings) {
 	dirs := cloudDriveDirs(settings)
 	defer s.finishActive(batchID)
 	err := s.runSafely(batchID, func() error {
@@ -451,7 +526,7 @@ func (s *Service) runCloudDriveBatch(ctx context.Context, batchID string, settin
 			}
 			_ = s.store.SetBatchTotal(ctx, batchID, len(files))
 			_ = s.progress(ctx, batchID)
-			if err := s.processFiles(ctx, batchID, dirs, files, classificationYAML, drive); err != nil {
+			if err := s.processFiles(ctx, batchID, dirs, files, systemSettings, drive); err != nil {
 				return err
 			}
 			return s.progress(ctx, batchID)
@@ -460,9 +535,13 @@ func (s *Service) runCloudDriveBatch(ctx context.Context, batchID string, settin
 	s.finishBatch(ctx, batchID, err)
 }
 
-func (s *Service) processFiles(ctx context.Context, batchID string, dirs models.DirectoryConfig, files []scanner.File, classificationYAML string, drive *clouddrive.DriveSession) error {
+func (s *Service) processFiles(ctx context.Context, batchID string, dirs models.DirectoryConfig, files []scanner.File, settings models.SystemSettings, drive *clouddrive.DriveSession) error {
 	if len(files) == 0 {
 		return nil
+	}
+	forcedAI, err := s.preAnalyzeFilenames(ctx, batchID, files, settings)
+	if err != nil {
+		return err
 	}
 	workers := scanFileConcurrency
 	if len(files) < workers {
@@ -480,7 +559,8 @@ func (s *Service) processFiles(ctx context.Context, batchID string, dirs models.
 					sendFirstErr(errs, err)
 					return
 				}
-				if err := s.processFile(ctx, batchID, dirs, scanned, classificationYAML, drive); isContextStopped(ctx, err) {
+				analysis, hasAnalysis := forcedAI[scanned.Path]
+				if err := s.processFile(ctx, batchID, dirs, scanned, settings, analysis, hasAnalysis, drive); isContextStopped(ctx, err) {
 					sendFirstErr(errs, err)
 					return
 				}
@@ -516,6 +596,325 @@ func sendFirstErr(errs chan<- error, err error) {
 	}
 }
 
+const aiFilenameBatchSize = 20
+
+func (s *Service) preAnalyzeFilenames(ctx context.Context, batchID string, files []scanner.File, settings models.SystemSettings) (map[string]aifilename.Analysis, error) {
+	results := map[string]aifilename.Analysis{}
+	if !settings.AIFilenameEnabled || !settings.AIFilenameForce {
+		return results, nil
+	}
+	client, err := aifilename.New(aiFilenameSettings(settings))
+	if err != nil {
+		return nil, parser.ParseError{Code: models.ErrParseTitleEmpty, Message: err.Error()}
+	}
+	pending := make([]aifilename.File, 0, min(aiFilenameBatchSize, len(files)))
+	flush := func() error {
+		if len(pending) == 0 {
+			return nil
+		}
+		result, err := client.AnalyzeDetailed(ctx, pending)
+		if err != nil {
+			for _, file := range pending {
+				s.recordAIFilenameLog(ctx, batchID, "", "force_batch", file, result.Log, nil, "failed", err.Error())
+			}
+			return err
+		}
+		byIndex := make(map[int]aifilename.Analysis, len(result.Items))
+		for _, analysis := range result.Items {
+			byIndex[analysis.Index] = analysis
+		}
+		for _, file := range pending {
+			analysis, ok := byIndex[file.Index]
+			if ok {
+				results[file.Path] = analysis
+				s.recordAIFilenameLog(ctx, batchID, "", "force_batch", file, result.Log, &analysis, "success", "")
+			} else {
+				s.recordAIFilenameLog(ctx, batchID, "", "force_batch", file, result.Log, nil, "failed", "AI 文件名识别没有返回该文件结果")
+			}
+		}
+		pending = pending[:0]
+		return nil
+	}
+	for index, file := range files {
+		if file.ErrorCode != "" {
+			continue
+		}
+		item := aiFilenameFile(index, file)
+		pending = append(pending, item)
+		if len(pending) >= aiFilenameBatchSize {
+			if err := flush(); err != nil {
+				return nil, parser.ParseError{Code: models.ErrParseTitleEmpty, Message: "AI 文件名识别失败: " + err.Error()}
+			}
+		}
+	}
+	if err := flush(); err != nil {
+		return nil, parser.ParseError{Code: models.ErrParseTitleEmpty, Message: "AI 文件名识别失败: " + err.Error()}
+	}
+	return results, nil
+}
+
+func (s *Service) parseWithAI(ctx context.Context, batchID, fileID string, scanned scanner.File, settings models.SystemSettings, forcedAnalysis aifilename.Analysis, hasForcedAnalysis bool) (parser.Result, error) {
+	if settings.AIFilenameEnabled && settings.AIFilenameForce {
+		if hasForcedAnalysis {
+			return parsedFromAI(scanned, forcedAnalysis)
+		}
+		return s.parseSingleWithAI(ctx, batchID, fileID, scanned, settings, nil, "force_single")
+	}
+	parsed, err := parser.ParsePath(scanned.Path)
+	if err != nil {
+		if settings.AIFilenameEnabled {
+			if aiParsed, aiErr := s.parseSingleWithAI(ctx, batchID, fileID, scanned, settings, nil, "fallback_parse_error"); aiErr == nil {
+				return aiParsed, nil
+			} else {
+				code, message := parseErr(err)
+				return parser.Result{}, parser.ParseError{Code: code, Message: message + "; AI 兜底失败: " + aiErr.Error()}
+			}
+		}
+		return parsed, err
+	}
+	if settings.AIFilenameEnabled && needsAIFilenameFallback(parsed) {
+		if aiParsed, aiErr := s.parseSingleWithAI(ctx, batchID, fileID, scanned, settings, &parsed, "fallback_low_confidence"); aiErr == nil {
+			return aiParsed, nil
+		}
+	}
+	return parsed, nil
+}
+
+func (s *Service) parseSingleWithAI(ctx context.Context, batchID, fileID string, scanned scanner.File, settings models.SystemSettings, local *parser.Result, source string) (parser.Result, error) {
+	client, err := aifilename.New(aiFilenameSettings(settings))
+	if err != nil {
+		return parser.Result{}, err
+	}
+	file := aiFilenameFile(0, scanned)
+	result, err := client.AnalyzeDetailed(ctx, []aifilename.File{file})
+	if err != nil {
+		s.recordAIFilenameLog(ctx, batchID, fileID, source, file, result.Log, nil, "failed", err.Error())
+		return parser.Result{}, err
+	}
+	if len(result.Items) == 0 {
+		err := errors.New("AI 文件名识别没有返回结果")
+		s.recordAIFilenameLog(ctx, batchID, fileID, source, file, result.Log, nil, "failed", err.Error())
+		return parser.Result{}, err
+	}
+	analysis := result.Items[0]
+	s.recordAIFilenameLog(ctx, batchID, fileID, source, file, result.Log, &analysis, "success", "")
+	return parsedFromAIWithLocal(scanned, analysis, local)
+}
+
+func needsAIFilenameFallback(parsed parser.Result) bool {
+	if parsed.Confidence > 0 && parsed.Confidence < 70 {
+		return true
+	}
+	if parsed.IsTV {
+		return strings.TrimSpace(parsed.ShowTitle) == "" || (parsed.Episode <= 0 && strings.TrimSpace(parsed.AirDate) == "")
+	}
+	return strings.TrimSpace(parsed.Title) == "" || parsed.Year == 0
+}
+
+func aiFilenameSettings(settings models.SystemSettings) aifilename.Settings {
+	return aifilename.Settings{
+		Enabled:      settings.AIFilenameEnabled,
+		Force:        settings.AIFilenameForce,
+		BaseURL:      settings.AIBaseURL,
+		APIKey:       settings.AIAPIKey,
+		Model:        settings.AIModel,
+		Prompt:       settings.AIFilenamePrompt,
+		NetworkProxy: settings.NetworkProxy,
+	}
+}
+
+func aiFilenameFile(index int, file scanner.File) aifilename.File {
+	return aifilename.File{
+		Index:     index,
+		Path:      file.Path,
+		Name:      file.Name,
+		Extension: file.Extension,
+		Size:      file.Size,
+	}
+}
+
+func (s *Service) recordAIFilenameLog(ctx context.Context, batchID, fileID, source string, file aifilename.File, call aifilename.CallLog, analysis *aifilename.Analysis, status, errorMessage string) {
+	if s == nil || s.store == nil {
+		return
+	}
+	entry := models.AIFilenameLog{
+		ID:             uuid.NewString(),
+		BatchID:        batchID,
+		FileID:         fileID,
+		FilePath:       file.Path,
+		FileName:       file.Name,
+		Source:         source,
+		Status:         status,
+		Model:          call.Model,
+		BaseURL:        call.BaseURL,
+		ProxyURL:       call.ProxyURL,
+		ResponseFormat: call.ResponseFormat,
+		RequestJSON:    call.RequestJSON,
+		ResponseJSON:   call.ResponseJSON,
+		HTTPStatus:     call.HTTPStatus,
+		DurationMS:     call.DurationMS,
+		Attempt:        call.Attempt,
+		ErrorMessage:   firstString(errorMessage, call.ErrorMessage),
+	}
+	if entry.FileName == "" {
+		entry.FileName = path.Base(strings.ReplaceAll(file.Path, "\\", "/"))
+	}
+	if analysis != nil {
+		entry.MediaType = analysis.MediaType
+		entry.Title = analysis.Title
+		entry.Year = analysis.Year
+		entry.Season = analysis.Season
+		entry.Episode = analysis.Episode
+		entry.Confidence = analysis.Confidence
+		entry.NeedsReview = analysis.NeedsReview
+		entry.Reason = analysis.Reason
+		if raw, err := json.Marshal(analysis); err == nil {
+			entry.ParsedJSON = string(raw)
+		}
+	}
+	if entry.Status == "" {
+		if entry.ErrorMessage != "" {
+			entry.Status = "failed"
+		} else {
+			entry.Status = "success"
+		}
+	}
+	_ = s.store.AddAIFilenameLog(ctx, entry)
+}
+
+func parsedFromAI(scanned scanner.File, analysis aifilename.Analysis) (parser.Result, error) {
+	return parsedFromAIWithLocal(scanned, analysis, nil)
+}
+
+func parsedFromAIWithLocal(scanned scanner.File, analysis aifilename.Analysis, local *parser.Result) (parser.Result, error) {
+	base := parser.Result{}
+	if local != nil {
+		base = *local
+	} else if parsed, err := parser.ParsePath(scanned.Path); err == nil {
+		base = parsed
+	}
+	base.Parser = "curio-ai"
+	base.Confidence = aiConfidence(analysis.Confidence)
+	if base.Confidence == 0 {
+		base.Confidence = 80
+	}
+	base.Extension = firstString(base.Extension, strings.TrimPrefix(strings.ToLower(filepath.Ext(scanned.Name)), "."), scanned.Extension)
+	base.Source = valueOrUnknown(firstString(base.Source, analysis.Source))
+	base.Edition = firstString(analysis.Edition, base.Edition)
+	base.ReleaseGroup = firstString(analysis.ReleaseGroup, base.ReleaseGroup)
+	base.AlternativeTitles = uniqueStrings(append(base.AlternativeTitles, analysis.AlternativeTitles...)...)
+	switch analysis.MediaType {
+	case models.MediaMovie:
+		title := strings.TrimSpace(analysis.Title)
+		if title == "" {
+			return parser.Result{}, parser.ParseError{Code: models.ErrParseTitleEmpty, Message: "AI 文件名识别没有返回电影标题"}
+		}
+		year := analysis.Year
+		if year == 0 {
+			year = base.Year
+		}
+		base.IsTV = false
+		base.Type = "movie"
+		base.Title = title
+		base.Year = year
+		base.ShowTitle = ""
+		base.ShowYear = 0
+		base.Season = 0
+		base.Episode = 0
+		base.Season2 = ""
+		base.Episode2 = ""
+		base.Episodes = nil
+		base.SearchTitles = uniqueStrings(append([]string{title}, analysis.AlternativeTitles...)...)
+		return base, nil
+	case models.MediaTVEpisode:
+		title := strings.TrimSpace(analysis.Title)
+		if title == "" {
+			return parser.Result{}, parser.ParseError{Code: models.ErrParseTitleEmpty, Message: "AI 文件名识别没有返回剧集标题"}
+		}
+		episode := analysis.Episode
+		if episode <= 0 {
+			return parser.Result{}, parser.ParseError{Code: models.ErrParseEpisodeEmpty, Message: "AI 文件名识别没有返回集号"}
+		}
+		season := analysis.Season
+		if season <= 0 {
+			season = 1
+		}
+		showYear := analysis.Year
+		if showYear == 0 {
+			showYear = base.ShowYear
+		}
+		base.IsTV = true
+		base.Type = "episode"
+		base.Title = ""
+		base.Year = 0
+		base.ShowTitle = title
+		base.ShowYear = showYear
+		base.Season = season
+		base.Episode = episode
+		base.Season2 = fmt.Sprintf("%02d", season)
+		base.Episode2 = fmt.Sprintf("%02d", episode)
+		base.Episodes = aiEpisodeRange(episode, analysis.EpisodeEnd)
+		base.SearchTitles = uniqueStrings(append([]string{title}, analysis.AlternativeTitles...)...)
+		return base, nil
+	default:
+		return parser.Result{}, parser.ParseError{Code: models.ErrParseTitleEmpty, Message: "AI 文件名识别无法判断媒体类型"}
+	}
+}
+
+func aiConfidence(value float64) int {
+	switch {
+	case value <= 0:
+		return 0
+	case value <= 1:
+		return int(value*100 + 0.5)
+	case value > 100:
+		return 100
+	default:
+		return int(value + 0.5)
+	}
+}
+
+func aiEpisodeRange(start, end int) []int {
+	if start <= 0 {
+		return nil
+	}
+	if end < start || end-start > 100 {
+		return []int{start}
+	}
+	out := make([]int, 0, end-start+1)
+	for current := start; current <= end; current++ {
+		out = append(out, current)
+	}
+	return out
+}
+
+func uniqueStrings(values ...string) []string {
+	out := make([]string, 0, len(values))
+	seen := map[string]struct{}{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		key := strings.ToLower(value)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, value)
+	}
+	return out
+}
+
+func firstString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
 func (s *Service) runSafely(batchID string, fn func() error) (err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -544,7 +943,7 @@ func (s *Service) checkCloudDrive(ctx context.Context, settings models.CloudDriv
 func cloudDriveAddressHint(address string) string {
 	value := strings.ToLower(strings.TrimSpace(address))
 	if strings.Contains(value, "localhost") || strings.Contains(value, "127.0.0.1") || strings.Contains(value, "::1") {
-		return "；当前 CloudDrive2 地址指向容器自身，在 NAS Docker 中请改为 http://host.docker.internal:19798 或 http://100.66.1.1:19798"
+		return "；当前 CloudDrive2 地址指向容器自身，在 NAS Docker 中请改为 http://host.docker.internal:19798 或宿主机/NAS 的局域网地址"
 	}
 	return ""
 }
@@ -581,7 +980,7 @@ func isContextStopped(ctx context.Context, err error) bool {
 	return ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
-func (s *Service) processFile(ctx context.Context, batchID string, dirs models.DirectoryConfig, scanned scanner.File, classificationYAML string, drive *clouddrive.DriveSession) error {
+func (s *Service) processFile(ctx context.Context, batchID string, dirs models.DirectoryConfig, scanned scanner.File, settings models.SystemSettings, forcedAnalysis aifilename.Analysis, hasForcedAnalysis bool, drive *clouddrive.DriveSession) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -602,6 +1001,7 @@ func (s *Service) processFile(ctx context.Context, batchID string, dirs models.D
 		_ = s.progress(ctx, batchID)
 		return err
 	}
+	_ = s.store.AttachAIFilenameLogFile(ctx, batchID, scanned.Path, file.ID)
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -626,7 +1026,7 @@ func (s *Service) processFile(ctx context.Context, batchID string, dirs models.D
 			s.fail(ctx, dirs, file, "", models.ErrDatabaseWriteFailed, err.Error())
 			return err
 		}
-		parsed, err := parser.ParsePath(file.OriginalPath)
+		parsed, err := s.parseWithAI(ctx, batchID, file.ID, scanned, settings, forcedAnalysis, hasForcedAnalysis)
 		if err != nil {
 			code, message := parseErr(err)
 			s.fail(ctx, dirs, file, "", code, message)
@@ -643,7 +1043,7 @@ func (s *Service) processFile(ctx context.Context, batchID string, dirs models.D
 			s.fail(ctx, dirs, file, "", models.ErrDatabaseWriteFailed, err.Error())
 			return err
 		}
-		return s.scrapeAndOrganize(ctx, dirs, file, parsed, technical, classificationYAML, scanned.Sidecars, drive)
+		return s.scrapeAndOrganize(ctx, dirs, file, parsed, technical, settings.ClassificationYAML, scanned.Sidecars, drive)
 	})
 }
 
@@ -661,6 +1061,19 @@ func (s *Service) scrapeAndOrganize(ctx context.Context, dirs models.DirectoryCo
 		code, message := scrapeErr(err)
 		s.fail(ctx, dirs, file, "", code, message)
 		return err
+	}
+	if result.MediaType == models.MediaTVEpisode {
+		updated := syncParsedTVEpisode(parsed, result)
+		if updated.ShowYear != parsed.ShowYear || updated.Season != parsed.Season || updated.Episode != parsed.Episode {
+			if err := s.store.UpdateMediaParsedTV(ctx, file.ID, updated.ShowYear, updated.Season, updated.Episode); err != nil {
+				if isContextStopped(ctx, err) {
+					return err
+				}
+				s.fail(ctx, dirs, file, "", models.ErrDatabaseWriteFailed, err.Error())
+				return err
+			}
+		}
+		parsed = updated
 	}
 	if err := s.persistMatch(ctx, file.ID, result); err != nil {
 		if isContextStopped(ctx, err) {
@@ -696,7 +1109,6 @@ func (s *Service) planAndMove(ctx context.Context, dirs models.DirectoryConfig, 
 	templateType := result.MediaType
 	root := dirs.StagingPath
 	finalStatus := models.StatusDone
-	completeCollection := false
 	values := namingValues(parsed, technical, result)
 	category, err := classifier.Match(classificationYAML, result.MediaType, classifierItem(result))
 	if err != nil {
@@ -723,7 +1135,6 @@ func (s *Service) planAndMove(ctx context.Context, dirs models.DirectoryConfig, 
 		status := "incomplete"
 		if check.Complete {
 			status = "complete"
-			completeCollection = true
 		}
 		_ = s.store.UpdateCollectionStatus(ctx, result.Collection.TMDBID, check.LocalCount, status)
 		if !check.Complete {
@@ -849,13 +1260,7 @@ func (s *Service) planAndMove(ctx context.Context, dirs models.DirectoryConfig, 
 	}
 	s.cleanupEmptyParents(ctx, dirs, sourceDir, sidecars, cloudSource, drive)
 	_ = s.store.IncrementBatch(ctx, file.BatchID, finalStatus)
-	if completeCollection {
-		if cloudSource {
-			s.migrateCompleteCloudCollection(ctx, dirs, result, values)
-		} else {
-			s.migrateCompleteCollection(ctx, dirs, result, values)
-		}
-	}
+	s.reconcileCompleteCollection(ctx, dirs, result, values, cloudSource)
 	return s.progress(ctx, file.BatchID)
 }
 
@@ -910,34 +1315,68 @@ func (s *Service) persistMatch(ctx context.Context, fileID string, result scrape
 	}
 }
 
-func (s *Service) migrateCompleteCollection(ctx context.Context, dirs models.DirectoryConfig, result scraper.Result, values map[string]string) {
+func (s *Service) reconcileCompleteCollection(ctx context.Context, dirs models.DirectoryConfig, result scraper.Result, values map[string]string, cloudSource bool) {
+	if result.MediaType != models.MediaCollectionMovie || result.Collection == nil {
+		return
+	}
 	_ = s.withLock(ctx, fmt.Sprintf("lock:collection:%d", result.Collection.TMDBID), time.Minute, func() error {
-		collectionTemplate, err := s.store.Template(ctx, models.TemplateCollectionMovie)
+		check, err := s.checker.Check(ctx, result.Collection.TMDBID, result.Movie.TMDBID)
 		if err != nil {
 			return err
 		}
-		incompleteTemplate, err := s.store.Template(ctx, models.TemplateIncompleteCollection)
-		if err != nil {
-			return err
+		status := "incomplete"
+		if check.Complete {
+			status = "complete"
 		}
-		incompleteRenderTemplate := templateWithImplicitCategory(incompleteTemplate.Template, values)
-		collectionRenderTemplate := templateWithImplicitCategory(collectionTemplate.Template, values)
-		sourceRoot, err := naming.TemplateRoot(models.TemplateIncompleteCollection, incompleteRenderTemplate, values, dirs.IncompleteCollectionsPath)
-		if err != nil {
-			return err
+		_ = s.store.UpdateCollectionStatus(ctx, result.Collection.TMDBID, check.LocalCount, status)
+		if !check.Complete {
+			return nil
 		}
-		targetRoot, err := naming.CollectionRoot(collectionRenderTemplate, values, dirs.StagingPath)
-		if err != nil {
-			return err
+		if cloudSource {
+			return s.migrateCompleteCloudCollectionLocked(ctx, dirs, result, values)
 		}
-		if err := organizer.MigrateCollection(sourceRoot, targetRoot); err != nil {
-			_ = s.store.AddHistory(ctx, uuid.NewString(), "", "", "", sourceRoot, targetRoot, "collection_complete_move", models.StatusFailed, models.ErrCollectionCompleteMoveFailed, err.Error())
-			return err
-		}
-		_ = s.store.UpdateCollectionPathPrefix(ctx, result.Collection.TMDBID, sourceRoot, targetRoot)
-		_ = s.store.AddCollectionCompletionHistory(ctx, uuid.NewString(), result.Collection.TMDBID, result.Collection.Name, sourceRoot, targetRoot, result.Collection.MovieCount)
-		return nil
+		return s.migrateCompleteCollectionLocked(ctx, dirs, result, values)
 	})
+}
+
+func (s *Service) migrateCompleteCollectionLocked(ctx context.Context, dirs models.DirectoryConfig, result scraper.Result, values map[string]string) error {
+	collectionTemplate, err := s.store.Template(ctx, models.TemplateCollectionMovie)
+	if err != nil {
+		return err
+	}
+	incompleteTemplate, err := s.store.Template(ctx, models.TemplateIncompleteCollection)
+	if err != nil {
+		return err
+	}
+	incompleteRenderTemplate := templateWithImplicitCategory(incompleteTemplate.Template, values)
+	collectionRenderTemplate := templateWithImplicitCategory(collectionTemplate.Template, values)
+	sourceRoot, err := naming.TemplateRoot(models.TemplateIncompleteCollection, incompleteRenderTemplate, values, dirs.IncompleteCollectionsPath)
+	if err != nil {
+		return err
+	}
+	targetRoot, err := naming.CollectionRoot(collectionRenderTemplate, values, dirs.StagingPath)
+	if err != nil {
+		return err
+	}
+	return s.moveCompleteCollection(ctx, *result.Collection, sourceRoot, targetRoot)
+}
+
+func (s *Service) moveCompleteCollection(ctx context.Context, collection models.CollectionMetadata, sourceRoot, targetRoot string) error {
+	if err := organizer.MigrateCollection(sourceRoot, targetRoot); err != nil {
+		_ = s.store.AddHistory(ctx, uuid.NewString(), "", "", "", sourceRoot, targetRoot, "collection_complete_move", models.StatusFailed, models.ErrCollectionCompleteMoveFailed, err.Error())
+		return err
+	}
+	batchIDs, err := s.store.UpdateCollectionPathPrefix(ctx, collection.TMDBID, sourceRoot, targetRoot)
+	if err != nil {
+		return err
+	}
+	for _, batchID := range batchIDs {
+		_ = s.store.RecountBatch(ctx, batchID)
+	}
+	if len(batchIDs) > 0 {
+		_ = s.store.AddCollectionCompletionHistory(ctx, uuid.NewString(), collection.TMDBID, collection.Name, sourceRoot, targetRoot, collection.MovieCount)
+	}
+	return nil
 }
 
 func (s *Service) fail(ctx context.Context, dirs models.DirectoryConfig, file models.MediaFile, taskID, code, message string) {
@@ -1039,19 +1478,8 @@ func (s *Service) probeTechnical(ctx context.Context, file models.MediaFile, dri
 }
 
 func (s *Service) ensureTechnicalForTemplate(ctx context.Context, file models.MediaFile, technical models.MediaTechnicalInfo, templateType, template string, drive *clouddrive.DriveSession) (models.MediaTechnicalInfo, error) {
-	fields, err := naming.Fields(templateType, template)
-	if err != nil {
+	if _, err := naming.Fields(templateType, template); err != nil {
 		return technical, codedWorkerError{code: models.ErrTemplateFieldInvalid, err: err}
-	}
-	needsProbe := false
-	for _, field := range fields {
-		if isTechnicalField(field) && technicalFieldMissing(technical, field) {
-			needsProbe = true
-			break
-		}
-	}
-	if !needsProbe {
-		return technical, nil
 	}
 	probed, err := s.probeTechnical(ctx, file, drive)
 	if err != nil {
@@ -1099,29 +1527,7 @@ func mediaTechnical(file models.MediaFile) models.MediaTechnicalInfo {
 	return technical
 }
 
-func isTechnicalField(field string) bool {
-	switch field {
-	case "resolution", "video_codec", "audio_codec", "audio_channels", "hdr_format":
-		return true
-	default:
-		return false
-	}
-}
-
-func technicalFieldMissing(technical models.MediaTechnicalInfo, field string) bool {
-	value := ""
-	switch field {
-	case "resolution":
-		value = technical.Resolution
-	case "video_codec":
-		value = technical.VideoCodec
-	case "audio_codec":
-		value = technical.AudioCodec
-	case "audio_channels":
-		value = technical.AudioChannels
-	case "hdr_format":
-		value = technical.HDRFormat
-	}
+func unknownValue(value string) bool {
 	value = strings.TrimSpace(value)
 	return value == "" || strings.EqualFold(value, mediainfo.Unknown)
 }
@@ -1133,6 +1539,29 @@ func mediaSourcePath(file models.MediaFile) string {
 		}
 	}
 	return ""
+}
+
+func rearchiveSourcePath(file models.MediaFile, override string) string {
+	override = strings.TrimSpace(override)
+	if override == "" {
+		return mediaSourcePath(file)
+	}
+	if clouddrive.IsURI(override) {
+		return clouddrive.URI(clouddrive.FromURI(override))
+	}
+	if mediaHasCloudPath(file) && strings.HasPrefix(strings.ReplaceAll(override, "\\", "/"), "/") {
+		return clouddrive.URI(override)
+	}
+	return override
+}
+
+func mediaHasCloudPath(file models.MediaFile) bool {
+	for _, value := range []string{file.CurrentPath, file.FinalPath, file.LastVerified, file.OriginalPath} {
+		if clouddrive.IsURI(value) {
+			return true
+		}
+	}
+	return false
 }
 
 func rearchiveParsed(file models.MediaFile, options RearchiveOptions) (parser.Result, error) {
@@ -1234,6 +1663,30 @@ func valueOrUnknown(value string) string {
 	return strings.TrimSpace(value)
 }
 
+func syncParsedTVEpisode(parsed parser.Result, result scraper.Result) parser.Result {
+	if result.MediaType != models.MediaTVEpisode {
+		return parsed
+	}
+	parsed.IsTV = true
+	if strings.TrimSpace(parsed.ShowTitle) == "" {
+		parsed.ShowTitle = result.TVShow.Name
+	}
+	if parsed.ShowYear == 0 {
+		parsed.ShowYear = result.TVShow.Year
+	}
+	parsed.Season = result.TVEpisode.Season
+	parsed.Episode = result.TVEpisode.Episode
+	parsed.Season2 = fmt.Sprintf("%02d", result.TVEpisode.Season)
+	parsed.Episode2 = fmt.Sprintf("%02d", result.TVEpisode.Episode)
+	if parsed.Episode > 0 {
+		parsed.Episodes = []int{parsed.Episode}
+	}
+	if strings.TrimSpace(parsed.AirDate) == "" {
+		parsed.AirDate = result.TVEpisode.AirDate
+	}
+	return parsed
+}
+
 func parsedDisplay(parsed parser.Result) (string, int) {
 	if parsed.IsTV {
 		return parsed.ShowTitle, parsed.ShowYear
@@ -1250,6 +1703,263 @@ func (s *Service) rearchiveDirs(ctx context.Context, file models.MediaFile) (mod
 		return cloudDriveDirs(settings), nil
 	}
 	return s.store.Directories(ctx)
+}
+
+func applyRearchiveTargetRoot(dirs *models.DirectoryConfig, file models.MediaFile, targetRoot string) error {
+	targetRoot = strings.TrimSpace(targetRoot)
+	if targetRoot == "" {
+		return nil
+	}
+	if clouddrive.IsURI(file.CurrentPath) {
+		root := clouddrive.NormalizePath(targetRoot)
+		if root == "/" {
+			return errors.New("target_root cannot be /")
+		}
+		dirs.StagingPath = root
+		return nil
+	}
+	if !filepath.IsAbs(targetRoot) {
+		return errors.New("target_root must be an absolute path")
+	}
+	dirs.StagingPath = filepath.Clean(targetRoot)
+	return nil
+}
+
+func (s *Service) findRearchiveSidecars(ctx context.Context, file models.MediaFile, cloudSource bool, drive *clouddrive.DriveSession) []scanner.Sidecar {
+	if cloudSource {
+		return findCloudRearchiveSidecars(ctx, file, drive)
+	}
+	return findLocalRearchiveSidecars(file)
+}
+
+func findCloudRearchiveSidecars(ctx context.Context, file models.MediaFile, drive *clouddrive.DriveSession) []scanner.Sidecar {
+	if drive == nil {
+		return nil
+	}
+	source := clouddrive.FromURI(file.CurrentPath)
+	sourceDir := path.Dir(source)
+	items, err := drive.List(ctx, sourceDir)
+	if err != nil {
+		return nil
+	}
+	media, sidecars, childDirs := collectCloudRearchiveItems(items)
+	ensureCurrentRearchiveMedia(&media, file, true)
+	for _, dir := range childDirs {
+		children, err := drive.List(ctx, dir)
+		if err != nil {
+			continue
+		}
+		for _, item := range children {
+			if item.IsDirectory || !scanner.IsSubtitleExtension(rearchiveExt(item.Name, item.Extension)) {
+				continue
+			}
+			sidecars = append(sidecars, scanner.Sidecar{
+				Path:      cloudItemURI(item),
+				Name:      item.Name,
+				Extension: strings.TrimPrefix(rearchiveExt(item.Name, item.Extension), "."),
+				Size:      item.Size,
+			})
+		}
+	}
+	return selectRearchiveSidecars(media, sidecars, file.CurrentPath, true)
+}
+
+func collectCloudRearchiveItems(items []clouddrive.File) ([]scanner.File, []scanner.Sidecar, []string) {
+	media := make([]scanner.File, 0)
+	sidecars := make([]scanner.Sidecar, 0)
+	childDirs := make([]string, 0)
+	for _, item := range items {
+		if item.IsDirectory {
+			childDirs = append(childDirs, item.Path)
+			continue
+		}
+		ext := rearchiveExt(item.Name, item.Extension)
+		switch {
+		case scanner.IsSubtitleExtension(ext):
+			sidecars = append(sidecars, scanner.Sidecar{
+				Path:      cloudItemURI(item),
+				Name:      item.Name,
+				Extension: strings.TrimPrefix(ext, "."),
+				Size:      item.Size,
+			})
+		case scanner.IsMediaExtension(ext):
+			media = append(media, scanner.File{
+				Path:      cloudItemURI(item),
+				Name:      item.Name,
+				Extension: strings.TrimPrefix(ext, "."),
+				Size:      item.Size,
+				Hash:      item.Hash,
+				HashType:  item.HashType,
+			})
+		}
+	}
+	return media, sidecars, childDirs
+}
+
+func findLocalRearchiveSidecars(file models.MediaFile) []scanner.Sidecar {
+	sourceDir := filepath.Dir(file.CurrentPath)
+	entries, err := os.ReadDir(sourceDir)
+	if err != nil {
+		return nil
+	}
+	media := make([]scanner.File, 0)
+	sidecars := make([]scanner.Sidecar, 0)
+	childDirs := make([]string, 0)
+	for _, entry := range entries {
+		fullPath := filepath.Join(sourceDir, entry.Name())
+		if entry.IsDir() {
+			childDirs = append(childDirs, fullPath)
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		ext := rearchiveExt(entry.Name(), "")
+		switch {
+		case scanner.IsSubtitleExtension(ext):
+			sidecars = append(sidecars, scanner.Sidecar{
+				Path:      fullPath,
+				Name:      entry.Name(),
+				Extension: strings.TrimPrefix(ext, "."),
+				Size:      info.Size(),
+			})
+		case scanner.IsMediaExtension(ext):
+			media = append(media, scanner.File{
+				Path:      fullPath,
+				Name:      entry.Name(),
+				Extension: strings.TrimPrefix(ext, "."),
+				Size:      info.Size(),
+			})
+		}
+	}
+	ensureCurrentRearchiveMedia(&media, file, false)
+	for _, dir := range childDirs {
+		children, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, entry := range children {
+			if entry.IsDir() {
+				continue
+			}
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+			ext := rearchiveExt(entry.Name(), "")
+			if !scanner.IsSubtitleExtension(ext) {
+				continue
+			}
+			sidecars = append(sidecars, scanner.Sidecar{
+				Path:      filepath.Join(dir, entry.Name()),
+				Name:      entry.Name(),
+				Extension: strings.TrimPrefix(ext, "."),
+				Size:      info.Size(),
+			})
+		}
+	}
+	return selectRearchiveSidecars(media, sidecars, file.CurrentPath, false)
+}
+
+func selectRearchiveSidecars(media []scanner.File, sidecars []scanner.Sidecar, sourcePath string, cloudSource bool) []scanner.Sidecar {
+	if len(sidecars) == 0 {
+		return nil
+	}
+	attached := scanner.AttachSidecars(media, sidecars)
+	sourceKey := rearchivePathKey(sourcePath, cloudSource)
+	sourceDir := rearchiveDirKey(sourcePath, cloudSource)
+	selected := make([]scanner.Sidecar, 0)
+	seen := map[string]struct{}{}
+	add := func(sidecar scanner.Sidecar) {
+		key := rearchivePathKey(sidecar.Path, cloudSource)
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		selected = append(selected, sidecar)
+	}
+	for _, item := range attached {
+		if rearchivePathKey(item.Path, cloudSource) != sourceKey {
+			continue
+		}
+		for _, sidecar := range item.Sidecars {
+			add(sidecar)
+		}
+		break
+	}
+	mediaInSourceDir := 0
+	for _, item := range media {
+		if rearchiveDirKey(item.Path, cloudSource) == sourceDir {
+			mediaInSourceDir++
+		}
+	}
+	if mediaInSourceDir == 1 {
+		for _, sidecar := range sidecars {
+			if rearchiveDirKey(sidecar.Path, cloudSource) == sourceDir {
+				add(sidecar)
+			}
+		}
+	}
+	return selected
+}
+
+func ensureCurrentRearchiveMedia(media *[]scanner.File, file models.MediaFile, cloudSource bool) {
+	sourceKey := rearchivePathKey(file.CurrentPath, cloudSource)
+	for _, item := range *media {
+		if rearchivePathKey(item.Path, cloudSource) == sourceKey {
+			return
+		}
+	}
+	name := filepath.Base(file.CurrentPath)
+	pathValue := file.CurrentPath
+	if cloudSource {
+		source := clouddrive.FromURI(file.CurrentPath)
+		name = path.Base(source)
+		pathValue = clouddrive.URI(source)
+	}
+	ext := rearchiveExt(name, file.Extension)
+	*media = append(*media, scanner.File{
+		Path:      pathValue,
+		Name:      name,
+		Extension: strings.TrimPrefix(ext, "."),
+		Size:      file.FileSize,
+		Hash:      file.FileHash,
+		HashType:  file.HashType,
+	})
+}
+
+func cloudItemURI(item clouddrive.File) string {
+	if strings.TrimSpace(item.URI) != "" {
+		return item.URI
+	}
+	return clouddrive.URI(item.Path)
+}
+
+func rearchiveExt(name, ext string) string {
+	ext = strings.TrimSpace(ext)
+	if ext == "" {
+		ext = filepath.Ext(name)
+	}
+	ext = strings.TrimPrefix(strings.ToLower(ext), ".")
+	if ext == "" {
+		return ""
+	}
+	return "." + ext
+}
+
+func rearchivePathKey(value string, cloudSource bool) string {
+	if cloudSource {
+		return strings.ToLower(clouddrive.NormalizePath(clouddrive.FromURI(value)))
+	}
+	return strings.ToLower(filepath.Clean(value))
+}
+
+func rearchiveDirKey(value string, cloudSource bool) string {
+	if cloudSource {
+		return strings.ToLower(path.Dir(clouddrive.NormalizePath(clouddrive.FromURI(value))))
+	}
+	return strings.ToLower(filepath.Clean(filepath.Dir(value)))
 }
 
 func (s *Service) finishMovedMedia(ctx context.Context, file models.MediaFile, taskID, movedPath, finalName, finalStatus string, cloudSource bool, drive *clouddrive.DriveSession) error {
@@ -1309,6 +2019,7 @@ func (s *Service) moveSidecars(ctx context.Context, file models.MediaFile, taskI
 }
 
 func (s *Service) cleanupEmptyParents(ctx context.Context, dirs models.DirectoryConfig, sourceDir string, sidecars []scanner.Sidecar, cloudSource bool, drive *clouddrive.DriveSession) {
+	stopRoot := cleanupStopRoot(dirs, sourceDir, cloudSource)
 	sidecarDirs := make([]string, 0, len(sidecars))
 	seen := map[string]struct{}{}
 	for _, sidecar := range sidecars {
@@ -1324,16 +2035,60 @@ func (s *Service) cleanupEmptyParents(ctx context.Context, dirs models.Directory
 	}
 	for _, dir := range sidecarDirs {
 		if cloudSource && drive != nil {
-			drive.DeleteEmptyParents(ctx, dir, dirs.IncomingPath)
+			drive.DeleteEmptyParents(ctx, dir, stopRoot)
 		} else if !cloudSource {
-			organizer.RemoveEmptyParents(dir, dirs.IncomingPath)
+			organizer.RemoveEmptyParents(dir, stopRoot)
 		}
 	}
 	if cloudSource && drive != nil {
-		drive.DeleteEmptyParents(ctx, sourceDir, dirs.IncomingPath)
+		drive.DeleteEmptyParents(ctx, sourceDir, stopRoot)
 	} else if !cloudSource {
-		organizer.RemoveEmptyParents(sourceDir, dirs.IncomingPath)
+		organizer.RemoveEmptyParents(sourceDir, stopRoot)
 	}
+}
+
+func cleanupStopRoot(dirs models.DirectoryConfig, sourceDir string, cloudSource bool) string {
+	candidates := []string{
+		dirs.IncomingPath,
+		dirs.StagingPath,
+		dirs.FailedPath,
+		dirs.IncompleteCollectionsPath,
+	}
+	best := ""
+	for _, candidate := range candidates {
+		if strings.TrimSpace(candidate) == "" {
+			continue
+		}
+		if cloudSource {
+			root := clouddrive.NormalizePath(candidate)
+			if cloudPathInside(root, sourceDir) && len(root) > len(best) {
+				best = root
+			}
+			continue
+		}
+		root := filepath.Clean(candidate)
+		if localPathInside(root, sourceDir) && len(root) > len(best) {
+			best = root
+		}
+	}
+	if best != "" {
+		return best
+	}
+	if cloudSource {
+		return cloudCleanupFallbackRoot(sourceDir)
+	}
+	return dirs.IncomingPath
+}
+
+func cloudCleanupFallbackRoot(sourceDir string) string {
+	parts := strings.Split(strings.Trim(clouddrive.NormalizePath(sourceDir), "/"), "/")
+	if len(parts) >= 2 {
+		return "/" + path.Join(parts[0], parts[1])
+	}
+	if len(parts) == 1 && parts[0] != "" {
+		return "/" + parts[0]
+	}
+	return "/"
 }
 
 func subtitleTarget(mediaTarget string, sidecar scanner.Sidecar, counts map[string]int) string {
@@ -1413,38 +2168,185 @@ func subtitleTokens(value string) []string {
 	})
 }
 
-func (s *Service) migrateCompleteCloudCollection(ctx context.Context, dirs models.DirectoryConfig, result scraper.Result, values map[string]string) {
-	_ = s.withLock(ctx, fmt.Sprintf("lock:collection:%d", result.Collection.TMDBID), time.Minute, func() error {
-		collectionTemplate, err := s.store.Template(ctx, models.TemplateCollectionMovie)
-		if err != nil {
-			return err
+func (s *Service) migrateCompleteCloudCollectionLocked(ctx context.Context, dirs models.DirectoryConfig, result scraper.Result, values map[string]string) error {
+	collectionTemplate, err := s.store.Template(ctx, models.TemplateCollectionMovie)
+	if err != nil {
+		return err
+	}
+	incompleteTemplate, err := s.store.Template(ctx, models.TemplateIncompleteCollection)
+	if err != nil {
+		return err
+	}
+	incompleteRenderTemplate := templateWithImplicitCategory(incompleteTemplate.Template, values)
+	collectionRenderTemplate := templateWithImplicitCategory(collectionTemplate.Template, values)
+	sourceRoot, err := naming.TemplateRoot(models.TemplateIncompleteCollection, incompleteRenderTemplate, values, dirs.IncompleteCollectionsPath)
+	if err != nil {
+		return err
+	}
+	targetRoot, err := naming.CollectionRoot(collectionRenderTemplate, values, dirs.StagingPath)
+	if err != nil {
+		return err
+	}
+	return s.moveCompleteCloudCollection(ctx, *result.Collection, sourceRoot, targetRoot)
+}
+
+func (s *Service) moveCompleteCloudCollection(ctx context.Context, collection models.CollectionMetadata, sourceRoot, targetRoot string) error {
+	settings, err := s.store.CloudDriveSettings(ctx)
+	if err != nil {
+		return err
+	}
+	sourceURI := clouddrive.URI(sourceRoot)
+	targetURI := clouddrive.URI(targetRoot)
+	if err := clouddrive.New(settings).MigrateCollection(ctx, sourceRoot, targetRoot); err != nil {
+		_ = s.store.AddHistory(ctx, uuid.NewString(), "", "", "", sourceURI, targetURI, "collection_complete_move", models.StatusFailed, models.ErrCollectionCompleteMoveFailed, err.Error())
+		return err
+	}
+	batchIDs, err := s.store.UpdateCollectionPathPrefix(ctx, collection.TMDBID, sourceURI, targetURI)
+	if err != nil {
+		return err
+	}
+	for _, batchID := range batchIDs {
+		_ = s.store.RecountBatch(ctx, batchID)
+	}
+	if len(batchIDs) > 0 {
+		_ = s.store.AddCollectionCompletionHistory(ctx, uuid.NewString(), collection.TMDBID, collection.Name, sourceURI, targetURI, collection.MovieCount)
+	}
+	return nil
+}
+
+func repairCollectionSourceRoot(paths []string, incompleteRoot string, cloudSource bool) string {
+	if cloudSource {
+		return repairCloudCollectionSourceRoot(paths, incompleteRoot)
+	}
+	return repairLocalCollectionSourceRoot(paths, incompleteRoot)
+}
+
+func repairLocalCollectionSourceRoot(paths []string, incompleteRoot string) string {
+	root := filepath.Clean(incompleteRoot)
+	dirs := make([]string, 0, len(paths))
+	for _, value := range paths {
+		if strings.TrimSpace(value) == "" {
+			continue
 		}
-		incompleteTemplate, err := s.store.Template(ctx, models.TemplateIncompleteCollection)
-		if err != nil {
-			return err
+		dirs = append(dirs, filepath.Dir(filepath.Clean(value)))
+	}
+	sourceRoot := commonLocalDir(dirs)
+	if sourceRoot == "" {
+		return ""
+	}
+	if len(dirs) == 1 {
+		sourceRoot = filepath.Dir(sourceRoot)
+	}
+	if !localPathInside(root, sourceRoot) || filepath.Clean(sourceRoot) == root {
+		return ""
+	}
+	return filepath.Clean(sourceRoot)
+}
+
+func repairCloudCollectionSourceRoot(paths []string, incompleteRoot string) string {
+	root := clouddrive.NormalizePath(incompleteRoot)
+	dirs := make([]string, 0, len(paths))
+	for _, value := range paths {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
 		}
-		incompleteRenderTemplate := templateWithImplicitCategory(incompleteTemplate.Template, values)
-		collectionRenderTemplate := templateWithImplicitCategory(collectionTemplate.Template, values)
-		sourceRoot, err := naming.TemplateRoot(models.TemplateIncompleteCollection, incompleteRenderTemplate, values, dirs.IncompleteCollectionsPath)
-		if err != nil {
-			return err
+		if clouddrive.IsURI(value) {
+			value = clouddrive.FromURI(value)
 		}
-		targetRoot, err := naming.CollectionRoot(collectionRenderTemplate, values, dirs.StagingPath)
-		if err != nil {
-			return err
+		dirs = append(dirs, path.Dir(clouddrive.NormalizePath(value)))
+	}
+	sourceRoot := commonCloudDir(dirs)
+	if sourceRoot == "" {
+		return ""
+	}
+	if len(dirs) == 1 {
+		sourceRoot = path.Dir(sourceRoot)
+	}
+	if !cloudPathInside(root, sourceRoot) || sourceRoot == root {
+		return ""
+	}
+	return sourceRoot
+}
+
+func repairCollectionValues(collection models.CollectionMetadata, sourceRoot, incompleteRoot string, cloudSource bool) map[string]string {
+	values := map[string]string{
+		"collection_name": collection.Name,
+		"collection_id":   strconv.Itoa(collection.TMDBID),
+	}
+	if category := repairCollectionCategory(sourceRoot, incompleteRoot, cloudSource); category != "" {
+		values["category"] = category
+	}
+	return values
+}
+
+func repairCollectionCategory(sourceRoot, incompleteRoot string, cloudSource bool) string {
+	if cloudSource {
+		rel := strings.TrimPrefix(strings.TrimPrefix(sourceRoot, clouddrive.NormalizePath(incompleteRoot)), "/")
+		parts := strings.Split(rel, "/")
+		if len(parts) > 1 {
+			return parts[0]
 		}
-		settings, err := s.store.CloudDriveSettings(ctx)
-		if err != nil {
-			return err
+		return ""
+	}
+	rel, err := filepath.Rel(filepath.Clean(incompleteRoot), filepath.Clean(sourceRoot))
+	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
+		return ""
+	}
+	parts := strings.Split(rel, string(filepath.Separator))
+	if len(parts) > 1 {
+		return parts[0]
+	}
+	return ""
+}
+
+func commonLocalDir(dirs []string) string {
+	if len(dirs) == 0 {
+		return ""
+	}
+	common := filepath.Clean(dirs[0])
+	for _, dir := range dirs[1:] {
+		dir = filepath.Clean(dir)
+		for common != "" && common != "." && !localPathInside(common, dir) {
+			next := filepath.Dir(common)
+			if next == common {
+				return ""
+			}
+			common = next
 		}
-		if err := clouddrive.New(settings).MigrateCollection(ctx, sourceRoot, targetRoot); err != nil {
-			_ = s.store.AddHistory(ctx, uuid.NewString(), "", "", "", clouddrive.URI(sourceRoot), clouddrive.URI(targetRoot), "collection_complete_move", models.StatusFailed, models.ErrCollectionCompleteMoveFailed, err.Error())
-			return err
+	}
+	return common
+}
+
+func commonCloudDir(dirs []string) string {
+	if len(dirs) == 0 {
+		return ""
+	}
+	common := clouddrive.NormalizePath(dirs[0])
+	for _, dir := range dirs[1:] {
+		dir = clouddrive.NormalizePath(dir)
+		for common != "" && common != "/" && !cloudPathInside(common, dir) {
+			next := path.Dir(common)
+			if next == common {
+				return ""
+			}
+			common = next
 		}
-		_ = s.store.UpdateCollectionPathPrefix(ctx, result.Collection.TMDBID, clouddrive.URI(sourceRoot), clouddrive.URI(targetRoot))
-		_ = s.store.AddCollectionCompletionHistory(ctx, uuid.NewString(), result.Collection.TMDBID, result.Collection.Name, clouddrive.URI(sourceRoot), clouddrive.URI(targetRoot), result.Collection.MovieCount)
-		return nil
-	})
+	}
+	return common
+}
+
+func localPathInside(root, target string) bool {
+	root = filepath.Clean(root)
+	target = filepath.Clean(target)
+	rel, err := filepath.Rel(root, target)
+	return err == nil && (rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))))
+}
+
+func cloudPathInside(root, target string) bool {
+	root = strings.TrimRight(clouddrive.NormalizePath(root), "/")
+	target = clouddrive.NormalizePath(target)
+	return target == root || strings.HasPrefix(target, root+"/")
 }
 
 func cloudDriveDirs(settings models.CloudDriveSettings) models.DirectoryConfig {
@@ -1526,6 +2428,10 @@ func namingValues(parsed parser.Result, technical models.MediaTechnicalInfo, res
 			values["collection_id"] = strconv.Itoa(result.Collection.TMDBID)
 		}
 	case models.MediaTVEpisode:
+		values["season"] = strconv.Itoa(result.TVEpisode.Season)
+		values["season_2"] = fmt.Sprintf("%02d", result.TVEpisode.Season)
+		values["episode"] = strconv.Itoa(result.TVEpisode.Episode)
+		values["episode_2"] = fmt.Sprintf("%02d", result.TVEpisode.Episode)
 		values["show_title"] = result.TVShow.Name
 		values["show_year"] = strconv.Itoa(result.TVShow.Year)
 		values["episode_title"] = result.TVEpisode.Title

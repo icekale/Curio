@@ -130,10 +130,28 @@ button:disabled {
   border-radius: 6px;
 }
 
-nav {
+.sidebarNav {
+  display: grid;
+  gap: 16px;
+  margin-top: 18px;
+}
+
+.navGroup {
+  display: grid;
+  gap: 6px;
+}
+
+.navGroupLabel {
+  padding: 0 12px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0;
+}
+
+.navGroupItems {
   display: grid;
   gap: 4px;
-  margin-top: 18px;
 }
 
 .nav,
@@ -168,10 +186,66 @@ nav {
 .nav {
   justify-content: flex-start;
   width: 100%;
-  padding: 0 14px;
+  padding: 5px 10px;
   color: var(--muted);
   background: transparent;
   font-weight: 500;
+}
+
+.navIcon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  flex: 0 0 30px;
+  border-radius: 8px;
+  color: #fff;
+  box-shadow: inset 0 -1px 0 rgba(0, 0, 0, 0.14);
+}
+
+.toneSky {
+  background: linear-gradient(135deg, #38bdf8, #2563eb);
+}
+
+.toneMint {
+  background: linear-gradient(135deg, #34d399, #0d9488);
+}
+
+.toneAmber {
+  background: linear-gradient(135deg, #fbbf24, #f97316);
+}
+
+.toneGreen {
+  background: linear-gradient(135deg, #22c55e, #15803d);
+}
+
+.toneRose {
+  background: linear-gradient(135deg, #fb7185, #dc2626);
+}
+
+.toneIndigo {
+  background: linear-gradient(135deg, #818cf8, #4f46e5);
+}
+
+.toneViolet {
+  background: linear-gradient(135deg, #a78bfa, #7c3aed);
+}
+
+.toneTeal {
+  background: linear-gradient(135deg, #2dd4bf, #0891b2);
+}
+
+.toneOrange {
+  background: linear-gradient(135deg, #fb923c, #ea580c);
+}
+
+.toneBlue {
+  background: linear-gradient(135deg, #60a5fa, #1d4ed8);
+}
+
+.toneSlate {
+  background: linear-gradient(135deg, #94a3b8, #475569);
 }
 
 .nav:hover,
@@ -189,8 +263,9 @@ nav {
 }
 
 .nav.active {
-  color: #0b57d0;
+  color: var(--ink);
   background: var(--accent-soft);
+  box-shadow: inset 0 0 0 1px rgba(11, 87, 208, 0.12);
 }
 
 .workspace {
@@ -502,6 +577,32 @@ tbody tr:hover {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+}
+
+.collectionTableActions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.collectionStatusSelect {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  width: 128px;
+  flex: 0 0 auto;
+}
+
+.collectionStatusSelect svg {
+  position: absolute;
+  left: 11px;
+  color: var(--muted);
+  pointer-events: none;
+}
+
+.collectionStatusSelect select {
+  height: 36px;
+  padding: 0 30px 0 34px;
 }
 
 .selectCol {
@@ -1192,6 +1293,8 @@ pre {
 .modalLoading {
   display: grid;
   place-items: center;
+  gap: 12px;
+  align-content: center;
   min-height: 260px;
   color: var(--muted);
 }
@@ -1436,6 +1539,12 @@ pre {
   overflow: auto;
 }
 
+.aiPromptField textarea {
+  min-height: 180px;
+  font-family: "Roboto Mono", "SFMono-Regular", Consolas, monospace;
+  line-height: 1.5;
+}
+
 .cidField {
   padding: 0 18px 4px;
 }
@@ -1524,6 +1633,134 @@ pre {
 
 .syncStatus.running {
   color: #0b57d0;
+}
+
+.logsPage {
+  display: grid;
+  gap: 16px;
+  width: min(1280px, 100%);
+  margin: 0 auto;
+}
+
+.logsTabBar {
+  top: 88px;
+}
+
+.logsTabBar .settingsTabButton {
+  min-width: 104px;
+}
+
+.blockMeta {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.logTable table {
+  min-width: 1120px;
+}
+
+.logTable th:nth-child(1),
+.logTable td:nth-child(1) {
+  width: 178px;
+}
+
+.logTable th:nth-child(2),
+.logTable td:nth-child(2) {
+  width: 98px;
+}
+
+.logTable th:nth-child(3),
+.logTable td:nth-child(3) {
+  width: 104px;
+}
+
+.logTable th:nth-child(5),
+.logTable td:nth-child(5) {
+  width: 142px;
+}
+
+.logTable th:nth-child(6),
+.logTable td:nth-child(6),
+.logTable th:nth-child(7),
+.logTable td:nth-child(7) {
+  width: 92px;
+}
+
+.logRow.clickable {
+  cursor: pointer;
+}
+
+.logMessageCell {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.logMessageCell b,
+.logMessageCell small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.logMessageCell b {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.logMessageCell small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.logDetailRow td {
+  height: auto;
+  padding: 0;
+  white-space: normal;
+  background: #fbfcff;
+}
+
+.logDetailGrid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  padding: 16px 18px;
+}
+
+.logDetailField {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.logDetailField.wide {
+  grid-column: 1 / -1;
+}
+
+.logDetailField span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.logDetailField code,
+.logDetailField pre {
+  max-height: 320px;
+  min-height: 38px;
+  margin: 0;
+  padding: 10px 12px;
+  overflow: auto;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-family: "Roboto Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
 }
 
 .settingsActions .primary,
@@ -1710,8 +1947,21 @@ pre {
     border-bottom: 1px solid var(--line);
   }
 
-  nav {
+  .sidebarNav {
     grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 8px;
+  }
+
+  .navGroup {
+    display: contents;
+  }
+
+  .navGroupLabel {
+    display: none;
+  }
+
+  .navGroupItems {
+    display: contents;
   }
 
   .overviewStrip,
@@ -1790,7 +2040,7 @@ pre {
     padding: 16px;
   }
 
-  nav {
+  .sidebarNav {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
@@ -1875,6 +2125,21 @@ pre {
 
   .collectionPartItem {
     grid-template-columns: 1fr;
+  }
+
+  .collectionTableActions {
+    align-items: stretch;
+    width: 100%;
+  }
+
+  .collectionStatusSelect {
+    width: 122px;
+  }
+
+  .collectionTableActions .tableSearch {
+    flex: 1 1 180px;
+    width: auto;
+    min-width: 0;
   }
 }
 

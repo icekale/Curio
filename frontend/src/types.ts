@@ -9,6 +9,12 @@ export type SystemSettings = {
   tmdb_api_key: string;
   network_proxy: string;
   classification_yaml: string;
+  ai_filename_enabled: boolean;
+  ai_filename_force: boolean;
+  ai_base_url: string;
+  ai_api_key: string;
+  ai_model: string;
+  ai_filename_prompt: string;
   updated_at: string;
 };
 
@@ -56,7 +62,7 @@ export type P115Settings = {
   cookie_login_app: string;
   strm_output_path: string;
   public_base_url: string;
-  libraries_yaml: string;
+  library_cid: string;
   delete_missing_strm: boolean;
   stale_before_delete: boolean;
   refresh_emby_after_sync: boolean;
@@ -76,6 +82,10 @@ export type P115Status = {
   user_name: string;
   can_export: boolean;
   can_play: boolean;
+  cookie_valid: boolean;
+  token_valid: boolean;
+  cookie_error: string;
+  token_error: string;
 };
 
 export type P115QRCodeSession = {
@@ -127,9 +137,41 @@ export type P115SyncRun = {
   skipped: number;
   failed: number;
   error_message: string;
+  event_summary: string;
   started_at: string;
   ended_at?: string;
   duration_ms: number;
+};
+
+export type LogEntry = {
+  id: string;
+  type: string;
+  source: string;
+  status: string;
+  message: string;
+  detail: string;
+  batch_id: string;
+  file_id: string;
+  file_name: string;
+  path: string;
+  model: string;
+  base_url: string;
+  proxy_url: string;
+  response_format: string;
+  request_json: string;
+  response_json: string;
+  parsed_json: string;
+  http_status: number;
+  duration_ms: number;
+  error_message: string;
+  created_at: string;
+};
+
+export type LogPage = {
+  items: LogEntry[];
+  total: number;
+  limit: number;
+  type: string;
 };
 
 export type ClassificationConfig = {
@@ -223,15 +265,22 @@ export type RearchiveBatchResult = {
 };
 
 export type Collection = {
+  id?: string;
+  kind?: string;
   tmdb_id: number;
+  source?: string;
+  source_url?: string;
   name: string;
   overview: string;
   movie_count: number;
   unreleased_count: number;
+  unresolved_count?: number;
   local_count: number;
   status: string;
   poster_path: string;
   backdrop_path: string;
+  last_refreshed_at?: string;
+  last_refresh_error?: string;
   parts?: CollectionMovie[];
 };
 
@@ -244,10 +293,22 @@ export type CollectionPage = {
 
 export type CollectionMovie = {
   collection_id: number;
+  list_id?: string;
   movie_tmdb_id: number;
+  douban_id?: string;
+  imdb_id?: string;
   title: string;
+  original_title?: string;
+  year?: number;
+  rating?: string;
+  poster_path?: string;
+  backdrop_path?: string;
+  source_url?: string;
+  match_status?: string;
+  error_message?: string;
   release_date: string;
   released: boolean;
+  resolved?: boolean;
   sort_order: number;
   local: boolean;
   file_id: string;

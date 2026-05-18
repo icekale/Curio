@@ -11,6 +11,7 @@ import (
 	"curio/internal/api"
 	"curio/internal/collection"
 	"curio/internal/config"
+	"curio/internal/curated"
 	"curio/internal/embyproxy"
 	"curio/internal/models"
 	"curio/internal/naming"
@@ -44,6 +45,10 @@ func main() {
 		TMDBAPIKey:               cfg.TMDBAPIKey,
 		NetworkProxy:             cfg.NetworkProxy,
 		ClassificationYAML:       config.DefaultClassificationYAML,
+		AIBaseURL:                cfg.AIBaseURL,
+		AIAPIKey:                 cfg.AIAPIKey,
+		AIModel:                  cfg.AIModel,
+		AIFilenamePrompt:         config.DefaultAIFilenamePrompt,
 		CloudDriveAddress:        cfg.CloudDriveAddr,
 		CloudDriveRootPath:       "/",
 		CloudDriveStagingPath:    "/Curio/staging",
@@ -65,8 +70,10 @@ func main() {
 	}
 	p115Service := p115.NewService(store)
 	p115Service.StartScheduler(ctx)
+	curatedService := curated.New(store, scraperClient)
+	curatedService.StartScheduler(ctx)
 	embyproxy.StartPortManager(ctx, store, p115Service)
-	handler := api.NewWithP115(store, workerService, scraperClient, redisClient, p115Service, cfg.FrontendOrigin, cfg.FrontendDir, cfg.AdminToken)
+	handler := api.NewWithServices(store, workerService, scraperClient, redisClient, p115Service, curatedService, cfg.FrontendOrigin, cfg.FrontendDir, cfg.AdminToken)
 	log.Printf("curio listening on %s", cfg.Addr)
 	if err := http.ListenAndServe(cfg.Addr, handler); err != nil {
 		log.Fatal(err)

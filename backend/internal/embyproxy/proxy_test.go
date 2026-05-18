@@ -1,11 +1,13 @@
 package embyproxy
 
 import (
+	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
 	"time"
 
+	"curio/internal/mediainfo"
 	"curio/internal/models"
 )
 
@@ -158,7 +160,8 @@ func TestApplyDirectPlayMediaSourceUsesNativeStreamURL(t *testing.T) {
 		"TranscodingSubProtocol": "hls",
 		"TranscodingContainer":   "ts",
 	}
-	applyDirectPlayMediaSource(source, req, "/Videos/123/stream.mkv?MediaSourceId=ms-1&Static=true", models.STRMLink{RelativePath: "movies/Dunkirk.mkv", Size: 123456789}, false)
+	streams := []any{map[string]any{"Index": 0, "Type": "Video", "Codec": "hevc"}}
+	applyDirectPlayMediaSource(source, req, "/Videos/123/stream.mkv?MediaSourceId=ms-1&Static=true", models.STRMLink{RelativePath: "movies/Dunkirk.mkv", Size: 123456789, MediaDurationTicks: 72000000000}, false, streams)
 	if got := source["Path"]; got != "http://192.168.10.83:8080/play/115/id/link-1/link-1.mkv" {
 		t.Fatalf("unexpected Path %#v", got)
 	}
@@ -170,6 +173,9 @@ func TestApplyDirectPlayMediaSourceUsesNativeStreamURL(t *testing.T) {
 	}
 	if got := source["Size"]; got != int64(123456789) {
 		t.Fatalf("unexpected Size %#v", got)
+	}
+	if got := source["RunTimeTicks"]; got != int64(72000000000) {
+		t.Fatalf("unexpected RunTimeTicks %#v", got)
 	}
 	if got := source["Protocol"]; got != "Http" {
 		t.Fatalf("unexpected Protocol %#v", got)
@@ -183,9 +189,9 @@ func TestApplyDirectPlayMediaSourceUsesNativeStreamURL(t *testing.T) {
 	if _, ok := source["RequiredHttpHeaders"]; ok {
 		t.Fatalf("expected required headers to be removed, got %#v", source["RequiredHttpHeaders"])
 	}
-	streams, ok := source["MediaStreams"].([]any)
-	if !ok || len(streams) != 2 {
-		t.Fatalf("expected fallback media streams, got %#v", source["MediaStreams"])
+	gotStreams, ok := source["MediaStreams"].([]any)
+	if !ok || len(gotStreams) != 1 {
+		t.Fatalf("expected probed media streams, got %#v", source["MediaStreams"])
 	}
 	if got := source["SupportsProbing"]; got != false {
 		t.Fatalf("unexpected SupportsProbing %#v", got)
@@ -198,7 +204,7 @@ func TestApplyDirectPlayMediaSourceCanRewritePathToProxyURL(t *testing.T) {
 		t.Fatal(err)
 	}
 	source := map[string]any{"Path": "http://172.16.0.1:8080/play/115/id/link-1/link-1.mkv"}
-	applyDirectPlayMediaSource(source, req, "/Videos/123/stream.mp4?Static=true", models.STRMLink{RelativePath: "tv/E01.mp4", Size: 987654321}, true)
+	applyDirectPlayMediaSource(source, req, "/Videos/123/stream.mp4?Static=true", models.STRMLink{RelativePath: "tv/E01.mp4", Size: 987654321}, true, nil)
 	if got := source["Path"]; got != "http://192.168.10.83:8097/Videos/123/stream.mp4?Static=true" {
 		t.Fatalf("unexpected Path %#v", got)
 	}
@@ -217,6 +223,29 @@ func TestMediaContainerForLinkIgnoresSTRMPathExtension(t *testing.T) {
 	})
 	if got != "m2ts" {
 		t.Fatalf("unexpected container %q", got)
+	}
+}
+
+func TestEmbyMediaStreamsFromProbePreservesAudioAndSubtitles(t *testing.T) {
+	streams := embyMediaStreamsFromProbe([]mediainfo.Stream{
+		{Index: 0, Type: "video", Codec: "hevc", Width: 3840, Height: 2160, VideoRange: "HDR10"},
+		{Index: 1, Type: "audio", Codec: "truehd", Channels: 8, ChannelLayout: "7.1", Language: "eng", Default: true},
+		{Index: 2, Type: "audio", Codec: "dts", Profile: "DTS-HD MA", Channels: 6, ChannelLayout: "5.1", Language: "jpn"},
+		{Index: 3, Type: "subtitle", Codec: "pgssub", Language: "chi", Forced: true},
+	}, models.STRMLink{RelativePath: "movies/Example.iso"})
+	if len(streams) != 4 {
+		t.Fatalf("expected all streams, got %#v", streams)
+	}
+	if index, ok := defaultStreamIndex(streams, "Audio"); !ok || index != 1 {
+		t.Fatalf("unexpected default audio index %d ok=%t", index, ok)
+	}
+	video, _ := streams[0].(map[string]any)
+	if video["Width"] != 3840 || video["Height"] != 2160 || video["VideoRange"] != "HDR10" {
+		t.Fatalf("unexpected video stream %#v", video)
+	}
+	subtitle, _ := streams[3].(map[string]any)
+	if subtitle["Type"] != "Subtitle" || subtitle["Codec"] != "pgs" || subtitle["IsForced"] != true {
+		t.Fatalf("unexpected subtitle stream %#v", subtitle)
 	}
 }
 
@@ -254,5 +283,143 @@ func TestDownloadItemIDSupportsDownloadRoutes(t *testing.T) {
 		if got := downloadItemID(raw); got != want {
 			t.Fatalf("downloadItemID(%q) = %q, want %q", raw, got, want)
 		}
+	}
+}
+
+func TestPlaybackCheckinRouteSupportsSessionAndLegacyRoutes(t *testing.T) {
+	cases := []struct {
+		method string
+		raw    string
+		kind   playbackCheckinKind
+		userID string
+		itemID string
+		ok     bool
+	}{
+		{http.MethodPost, "/Sessions/Playing", playbackCheckinPlaying, "", "", true},
+		{http.MethodPost, "/Sessions/Playing/Progress", playbackCheckinProgress, "", "", true},
+		{http.MethodPost, "/Sessions/Playing/Stopped", playbackCheckinStopped, "", "", true},
+		{http.MethodPost, "/Users/user-1/PlayingItems/21642/Progress", playbackCheckinProgress, "user-1", "21642", true},
+		{http.MethodDelete, "/Users/user-1/PlayingItems/21642", playbackCheckinStopped, "user-1", "21642", true},
+		{http.MethodGet, "/Items/21642", "", "", "", false},
+	}
+	for _, tc := range cases {
+		got, ok := playbackCheckinRoute(tc.method, tc.raw)
+		if ok != tc.ok {
+			t.Fatalf("playbackCheckinRoute(%q) ok=%t want %t", tc.raw, ok, tc.ok)
+		}
+		if !ok {
+			continue
+		}
+		if got.Kind != tc.kind || got.UserID != tc.userID || got.ItemID != tc.itemID {
+			t.Fatalf("playbackCheckinRoute(%q) = %#v", tc.raw, got)
+		}
+	}
+}
+
+func TestParsePlaybackCheckinReadsBodyQueryAndAuthorization(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "http://127.0.0.1:8097/Sessions/Playing/Progress?PlaySessionId=query-session", strings.NewReader(`{"ItemId":"21642","MediaSourceId":"ms-1","PositionTicks":123000000,"CanSeek":false}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Emby-Authorization", `MediaBrowser Client="Yamby", UserId="user-1", Token="token"`)
+	route := playbackCheckinRouteInfo{Kind: playbackCheckinProgress}
+	body := []byte(`{"ItemId":"21642","MediaSourceId":"ms-1","PositionTicks":123000000,"CanSeek":false}`)
+	got := parsePlaybackCheckin(req, route, body)
+	if got.ItemID != "21642" || got.UserID != "user-1" || got.MediaSourceID != "ms-1" || got.PlaySessionID != "query-session" {
+		t.Fatalf("unexpected checkin %#v", got)
+	}
+	if !got.HasPositionTicks || got.PositionTicks != 123000000 {
+		t.Fatalf("unexpected position %#v", got)
+	}
+	if !got.HasCanSeek || got.CanSeek {
+		t.Fatalf("unexpected can seek %#v", got)
+	}
+}
+
+func TestRewritePlaybackCheckinBodyPositionUsesLastValidPosition(t *testing.T) {
+	body := []byte(`{"ItemId":"21642","PositionTicks":-10000000}`)
+	checkin := playbackCheckin{Kind: playbackCheckinStopped, ItemID: "21642", PositionTicks: -10000000, HasPositionTicks: true}
+	state := playbackSessionState{LastPositionTicks: 700000000}
+	next, changed := rewritePlaybackCheckinBodyPosition(body, checkin, state)
+	if !changed {
+		t.Fatal("expected body to be patched")
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(next, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if got := int64(payload["PositionTicks"].(float64)); got != 700000000 {
+		t.Fatalf("unexpected patched position %d", got)
+	}
+}
+
+func TestPlaybackCorrectionDecisions(t *testing.T) {
+	duration := int64(1000 * embyTickPerSecond)
+	cases := []struct {
+		name     string
+		checkin  playbackCheckin
+		state    playbackSessionState
+		want     playbackCorrectionAction
+		wantPos  int64
+		wantText string
+	}{
+		{
+			name:     "invalid stop clears watched",
+			checkin:  playbackCheckin{Kind: playbackCheckinStopped, PositionTicks: -10000000, HasPositionTicks: true},
+			state:    playbackSessionState{RunTimeTicks: duration},
+			want:     playbackCorrectionClearWatched,
+			wantPos:  0,
+			wantText: "invalid",
+		},
+		{
+			name:     "short playback clears watched",
+			checkin:  playbackCheckin{Kind: playbackCheckinStopped, PositionTicks: 30 * embyTickPerSecond, HasPositionTicks: true},
+			state:    playbackSessionState{RunTimeTicks: duration},
+			want:     playbackCorrectionClearWatched,
+			wantPos:  30 * embyTickPerSecond,
+			wantText: "threshold",
+		},
+		{
+			name:     "middle playback saves resume",
+			checkin:  playbackCheckin{Kind: playbackCheckinStopped, PositionTicks: 200 * embyTickPerSecond, HasPositionTicks: true},
+			state:    playbackSessionState{RunTimeTicks: duration},
+			want:     playbackCorrectionSaveResume,
+			wantPos:  200 * embyTickPerSecond,
+			wantText: "watched",
+		},
+		{
+			name:     "near end lets emby decide watched",
+			checkin:  playbackCheckin{Kind: playbackCheckinStopped, PositionTicks: 920 * embyTickPerSecond, HasPositionTicks: true},
+			state:    playbackSessionState{RunTimeTicks: duration},
+			want:     playbackCorrectionNone,
+			wantPos:  920 * embyTickPerSecond,
+			wantText: "watched",
+		},
+	}
+	for _, tc := range cases {
+		got := playbackCorrection(tc.checkin, tc.state)
+		if got.Action != tc.want || got.PositionTicks != tc.wantPos || !strings.Contains(got.Reason, tc.wantText) {
+			t.Fatalf("%s: got %#v", tc.name, got)
+		}
+	}
+}
+
+func TestPlaybackSessionStateMergesAliases(t *testing.T) {
+	proxy := New(nil, nil)
+	first := playbackCheckin{
+		Kind:             playbackCheckinProgress,
+		UserID:           "user-1",
+		ItemID:           "21642",
+		PlaySessionID:    "session-1",
+		PositionTicks:    120 * embyTickPerSecond,
+		HasPositionTicks: true,
+	}
+	state := proxy.rememberPlaybackCheckin(first, models.STRMLink{ID: "link-1", MediaDurationTicks: 1000 * embyTickPerSecond})
+	if state.LastPositionTicks != 120*embyTickPerSecond {
+		t.Fatalf("unexpected state %#v", state)
+	}
+	merged := proxy.mergePlaybackCheckinState(playbackCheckin{Kind: playbackCheckinStopped, PlaySessionID: "session-1"})
+	if merged.UserID != "user-1" || merged.ItemID != "21642" || merged.RunTimeTicks != 1000*embyTickPerSecond {
+		t.Fatalf("unexpected merged checkin %#v", merged)
 	}
 }

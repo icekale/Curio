@@ -2,15 +2,11 @@ package p115
 
 import "testing"
 
-func TestParseLibrariesPlainCID(t *testing.T) {
-	cfg, err := ParseLibraries("3428557242282467406")
+func TestParseLibraryCID(t *testing.T) {
+	lib, err := ParseLibraryCID("3428557242282467406")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(cfg.Libraries) != 1 {
-		t.Fatalf("expected 1 library, got %d", len(cfg.Libraries))
-	}
-	lib := cfg.Libraries[0]
 	if lib.CID != "3428557242282467406" {
 		t.Fatalf("unexpected cid %q", lib.CID)
 	}
@@ -19,6 +15,15 @@ func TestParseLibrariesPlainCID(t *testing.T) {
 	}
 	if lib.LayerLimit != 25 {
 		t.Fatalf("unexpected layer limit %d", lib.LayerLimit)
+	}
+}
+
+func TestParseLibraryCIDRejectsStructuredConfig(t *testing.T) {
+	if _, err := ParseLibraryCID("cid: 3428557242282467406"); err == nil {
+		t.Fatal("expected structured config to be rejected")
+	}
+	if _, err := ParseLibraryCID("3428557242282467406\n123"); err == nil {
+		t.Fatal("expected multi-line config to be rejected")
 	}
 }
 

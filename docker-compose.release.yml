@@ -35,7 +35,7 @@ services:
     restart: unless-stopped
 
   curio:
-    image: mon3trd/curio:1.0.2
+    image: mon3trd/curio:1.0.3
     user: "0:0"
     environment:
       TZ: Asia/Shanghai
@@ -47,6 +47,9 @@ services:
       FRONTEND_DIR: "/app/public"
       TMDB_API_KEY: ""
       NETWORK_PROXY: ""
+      AI_BASE_URL: "https://api.openai.com/v1"
+      AI_API_KEY: ""
+      AI_MODEL: "gpt-5.5"
       CURIO_PLAY_SECRET: "change-me"
     ports:
       - "8080:8080"

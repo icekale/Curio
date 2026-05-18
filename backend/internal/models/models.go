@@ -49,6 +49,7 @@ const (
 	P115SyncTriggerManualExport  = "manual_export"
 	P115SyncTriggerManualSync    = "manual_sync"
 	P115SyncTriggerManualCleanup = "manual_cleanup"
+	P115SyncTriggerRebuildNodes  = "manual_rebuild_nodes"
 	P115SyncTriggerCron          = "cron"
 
 	P115SyncStatusRunning = "running"
@@ -68,6 +69,13 @@ const (
 	MediaMovie           = "movie"
 	MediaTVEpisode       = "tv_episode"
 	MediaCollectionMovie = "collection_movie"
+)
+
+const (
+	CollectionKindTMDB    = "tmdb_collection"
+	CollectionKindCurated = "curated_list"
+
+	CuratedDoubanTop250ID = "douban_top250"
 )
 
 const (
@@ -112,6 +120,12 @@ type SystemSettings struct {
 	TMDBAPIKey               string    `json:"tmdb_api_key"`
 	NetworkProxy             string    `json:"network_proxy"`
 	ClassificationYAML       string    `json:"classification_yaml"`
+	AIFilenameEnabled        bool      `json:"ai_filename_enabled"`
+	AIFilenameForce          bool      `json:"ai_filename_force"`
+	AIBaseURL                string    `json:"ai_base_url"`
+	AIAPIKey                 string    `json:"ai_api_key"`
+	AIModel                  string    `json:"ai_model"`
+	AIFilenamePrompt         string    `json:"ai_filename_prompt"`
 	CloudDriveAddress        string    `json:"clouddrive_address"`
 	CloudDriveUsername       string    `json:"clouddrive_username"`
 	CloudDrivePassword       string    `json:"clouddrive_password"`
@@ -149,7 +163,7 @@ type P115Settings struct {
 	DirectURLTTLSeconds  int       `json:"-"`
 	UserAgentMode        string    `json:"-"`
 	FixedUserAgent       string    `json:"-"`
-	LibrariesYAML        string    `json:"libraries_yaml"`
+	LibraryCID           string    `json:"library_cid"`
 	DeleteMissingSTRM    bool      `json:"delete_missing_strm"`
 	StaleBeforeDelete    bool      `json:"stale_before_delete"`
 	KeepDeletedDays      int       `json:"-"`
@@ -165,11 +179,15 @@ type P115Settings struct {
 }
 
 type P115Status struct {
-	Ready     bool   `json:"ready"`
-	Message   string `json:"message"`
-	UserName  string `json:"user_name"`
-	CanExport bool   `json:"can_export"`
-	CanPlay   bool   `json:"can_play"`
+	Ready       bool   `json:"ready"`
+	Message     string `json:"message"`
+	UserName    string `json:"user_name"`
+	CanExport   bool   `json:"can_export"`
+	CanPlay     bool   `json:"can_play"`
+	CookieValid bool   `json:"cookie_valid"`
+	TokenValid  bool   `json:"token_valid"`
+	CookieError string `json:"cookie_error"`
+	TokenError  string `json:"token_error"`
 }
 
 type P115QRCodeSession struct {
@@ -196,40 +214,45 @@ type P115AuthResult struct {
 }
 
 type STRMLink struct {
-	ID             string     `json:"id"`
-	Provider       string     `json:"provider"`
-	LibraryCID     string     `json:"library_cid"`
-	LibraryName    string     `json:"library_name"`
-	LibraryType    string     `json:"library_type"`
-	RelativePath   string     `json:"relative_path"`
-	RemotePath     string     `json:"remote_path"`
-	RemoteFileID   string     `json:"remote_file_id"`
-	PickCode       string     `json:"pickcode"`
-	SHA1           string     `json:"sha1"`
-	Size           int64      `json:"size"`
-	STRMPath       string     `json:"strm_path"`
-	PlayPath       string     `json:"play_path"`
-	SourceTreeHash string     `json:"source_tree_hash"`
-	TreeVersion    string     `json:"tree_version"`
-	ResolveStatus  string     `json:"resolve_status"`
-	Status         string     `json:"status"`
-	ErrorCode      string     `json:"error_code"`
-	ErrorMessage   string     `json:"error_message"`
-	GeneratedAt    time.Time  `json:"generated_at"`
-	ResolvedAt     *time.Time `json:"resolved_at,omitempty"`
-	UpdatedAt      time.Time  `json:"updated_at"`
+	ID                 string     `json:"id"`
+	Provider           string     `json:"provider"`
+	LibraryCID         string     `json:"library_cid"`
+	LibraryName        string     `json:"library_name"`
+	LibraryType        string     `json:"library_type"`
+	RelativePath       string     `json:"relative_path"`
+	RemotePath         string     `json:"remote_path"`
+	RemoteFileID       string     `json:"remote_file_id"`
+	PickCode           string     `json:"pickcode"`
+	SHA1               string     `json:"sha1"`
+	Size               int64      `json:"size"`
+	STRMPath           string     `json:"strm_path"`
+	PlayPath           string     `json:"play_path"`
+	SourceTreeHash     string     `json:"source_tree_hash"`
+	TreeVersion        string     `json:"tree_version"`
+	ResolveStatus      string     `json:"resolve_status"`
+	Status             string     `json:"status"`
+	ErrorCode          string     `json:"error_code"`
+	ErrorMessage       string     `json:"error_message"`
+	MediaStreams       string     `json:"media_streams,omitempty"`
+	MediaDurationTicks int64      `json:"media_duration_ticks,omitempty"`
+	MediaProbedAt      *time.Time `json:"media_probed_at,omitempty"`
+	MediaProbeError    string     `json:"media_probe_error,omitempty"`
+	GeneratedAt        time.Time  `json:"generated_at"`
+	ResolvedAt         *time.Time `json:"resolved_at,omitempty"`
+	UpdatedAt          time.Time  `json:"updated_at"`
 }
 
 type STRMSyncResult struct {
-	TreeVersion string `json:"tree_version"`
-	Mode        string `json:"mode"`
-	Exported    int    `json:"exported"`
-	Generated   int    `json:"generated"`
-	Restored    int    `json:"restored"`
-	Updated     int    `json:"updated"`
-	Deleted     int    `json:"deleted"`
-	Skipped     int    `json:"skipped"`
-	Failed      int    `json:"failed"`
+	TreeVersion  string `json:"tree_version"`
+	Mode         string `json:"mode"`
+	EventSummary string `json:"event_summary,omitempty"`
+	Exported     int    `json:"exported"`
+	Generated    int    `json:"generated"`
+	Restored     int    `json:"restored"`
+	Updated      int    `json:"updated"`
+	Deleted      int    `json:"deleted"`
+	Skipped      int    `json:"skipped"`
+	Failed       int    `json:"failed"`
 }
 
 type P115SyncRun struct {
@@ -246,9 +269,71 @@ type P115SyncRun struct {
 	Skipped      int        `json:"skipped"`
 	Failed       int        `json:"failed"`
 	ErrorMessage string     `json:"error_message"`
+	EventSummary string     `json:"event_summary"`
 	StartedAt    time.Time  `json:"started_at"`
 	EndedAt      *time.Time `json:"ended_at,omitempty"`
 	DurationMS   int64      `json:"duration_ms"`
+}
+
+type AIFilenameLog struct {
+	ID             string    `json:"id"`
+	BatchID        string    `json:"batch_id"`
+	FileID         string    `json:"file_id"`
+	FilePath       string    `json:"file_path"`
+	FileName       string    `json:"file_name"`
+	Source         string    `json:"source"`
+	Status         string    `json:"status"`
+	Model          string    `json:"model"`
+	BaseURL        string    `json:"base_url"`
+	ProxyURL       string    `json:"proxy_url"`
+	ResponseFormat string    `json:"response_format"`
+	RequestJSON    string    `json:"request_json"`
+	ResponseJSON   string    `json:"response_json"`
+	ParsedJSON     string    `json:"parsed_json"`
+	HTTPStatus     int       `json:"http_status"`
+	DurationMS     int64     `json:"duration_ms"`
+	Attempt        int       `json:"attempt"`
+	MediaType      string    `json:"media_type"`
+	Title          string    `json:"title"`
+	Year           int       `json:"year"`
+	Season         int       `json:"season"`
+	Episode        int       `json:"episode"`
+	Confidence     float64   `json:"confidence"`
+	NeedsReview    bool      `json:"needs_review"`
+	Reason         string    `json:"reason"`
+	ErrorMessage   string    `json:"error_message"`
+	CreatedAt      time.Time `json:"created_at"`
+}
+
+type LogEntry struct {
+	ID             string    `json:"id"`
+	Type           string    `json:"type"`
+	Source         string    `json:"source"`
+	Status         string    `json:"status"`
+	Message        string    `json:"message"`
+	Detail         string    `json:"detail"`
+	BatchID        string    `json:"batch_id"`
+	FileID         string    `json:"file_id"`
+	FileName       string    `json:"file_name"`
+	Path           string    `json:"path"`
+	Model          string    `json:"model"`
+	BaseURL        string    `json:"base_url"`
+	ProxyURL       string    `json:"proxy_url"`
+	ResponseFormat string    `json:"response_format"`
+	RequestJSON    string    `json:"request_json"`
+	ResponseJSON   string    `json:"response_json"`
+	ParsedJSON     string    `json:"parsed_json"`
+	HTTPStatus     int       `json:"http_status"`
+	DurationMS     int64     `json:"duration_ms"`
+	ErrorMessage   string    `json:"error_message"`
+	CreatedAt      time.Time `json:"created_at"`
+}
+
+type LogPage struct {
+	Items []LogEntry `json:"items"`
+	Total int        `json:"total"`
+	Limit int        `json:"limit"`
+	Type  string     `json:"type"`
 }
 
 type P115TreeSnapshotItem struct {
@@ -480,16 +565,23 @@ type TVSeasonStatus struct {
 }
 
 type CollectionMetadata struct {
-	TMDBID          int                       `json:"tmdb_id"`
-	Name            string                    `json:"name"`
-	Overview        string                    `json:"overview"`
-	MovieCount      int                       `json:"movie_count"`
-	UnreleasedCount int                       `json:"unreleased_count"`
-	LocalCount      int                       `json:"local_count"`
-	Status          string                    `json:"status"`
-	PosterPath      string                    `json:"poster_path"`
-	BackdropPath    string                    `json:"backdrop_path"`
-	Parts           []CollectionMovieMetadata `json:"parts,omitempty"`
+	ID               string                    `json:"id,omitempty"`
+	Kind             string                    `json:"kind"`
+	TMDBID           int                       `json:"tmdb_id"`
+	Source           string                    `json:"source,omitempty"`
+	SourceURL        string                    `json:"source_url,omitempty"`
+	Name             string                    `json:"name"`
+	Overview         string                    `json:"overview"`
+	MovieCount       int                       `json:"movie_count"`
+	UnreleasedCount  int                       `json:"unreleased_count"`
+	UnresolvedCount  int                       `json:"unresolved_count,omitempty"`
+	LocalCount       int                       `json:"local_count"`
+	Status           string                    `json:"status"`
+	PosterPath       string                    `json:"poster_path"`
+	BackdropPath     string                    `json:"backdrop_path"`
+	LastRefreshedAt  *time.Time                `json:"last_refreshed_at,omitempty"`
+	LastRefreshError string                    `json:"last_refresh_error,omitempty"`
+	Parts            []CollectionMovieMetadata `json:"parts,omitempty"`
 }
 
 type CollectionPage struct {
@@ -501,10 +593,22 @@ type CollectionPage struct {
 
 type CollectionMovieMetadata struct {
 	CollectionID  int    `json:"collection_id"`
+	ListID        string `json:"list_id,omitempty"`
 	MovieTMDBID   int    `json:"movie_tmdb_id"`
+	DoubanID      string `json:"douban_id,omitempty"`
+	IMDBID        string `json:"imdb_id,omitempty"`
 	Title         string `json:"title"`
+	OriginalTitle string `json:"original_title,omitempty"`
+	Year          int    `json:"year,omitempty"`
+	Rating        string `json:"rating,omitempty"`
+	PosterPath    string `json:"poster_path,omitempty"`
+	BackdropPath  string `json:"backdrop_path,omitempty"`
+	SourceURL     string `json:"source_url,omitempty"`
+	MatchStatus   string `json:"match_status,omitempty"`
+	ErrorMessage  string `json:"error_message,omitempty"`
 	ReleaseDate   string `json:"release_date"`
 	Released      bool   `json:"released"`
+	Resolved      bool   `json:"resolved"`
 	SortOrder     int    `json:"sort_order"`
 	Local         bool   `json:"local"`
 	FileID        string `json:"file_id"`

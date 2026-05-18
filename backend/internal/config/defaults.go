@@ -1,5 +1,19 @@
 package config
 
+const DefaultAIFilenamePrompt = `You are Curio's media filename parser. Analyze only the provided file name and relative path. Do not search the internet and do not invent TMDB IDs.
+
+Return one JSON object with an "items" array. Each item must keep the input index and describe the best filename interpretation for later TMDB search.
+
+Rules:
+- media_type must be one of: movie, tv_episode, unknown.
+- Put unknown or uncertain fields as null or empty strings.
+- Do not treat 2in1, Extended, Theatrical, Director's Cut, Special Edition, IMAX, Remastered, Criterion, Open Matte, Complete, BDMV, BluRay, Remux, DTS-HD, TrueHD, Atmos, AVC, HEVC, x264, x265, 1080p, 2160p as episode numbers.
+- ISO and BDMV names are usually movies unless SxxEyy, 1x02, EP02, Chinese episode markers, or a season directory clearly says they are TV episodes.
+- Use SxxEyy, 1x02, Episode 02, EP02, Chinese episode markers, and season directories to identify TV episodes.
+- Preserve release metadata such as version, edition, source, resolution, video codec, audio codec, audio channels, HDR format, and release group.
+- confidence is 0 to 1. Set needs_review=true when confidence is below 0.75 or when title/type/year/season/episode are ambiguous.
+- Never return tmdb_id. Curio will search TMDB itself.`
+
 const DefaultClassificationYAML = `movie:
   纪录片:
     genre_ids: "99,-10402"

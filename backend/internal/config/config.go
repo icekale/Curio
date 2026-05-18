@@ -13,6 +13,9 @@ type Config struct {
 	AdminToken     string
 	TMDBAPIKey     string
 	NetworkProxy   string
+	AIBaseURL      string
+	AIAPIKey       string
+	AIModel        string
 	CloudDriveAddr string
 	FrontendOrigin string
 	FrontendDir    string
@@ -29,6 +32,9 @@ func Load() Config {
 		AdminToken:     os.Getenv("CURIO_ADMIN_TOKEN"),
 		TMDBAPIKey:     os.Getenv("TMDB_API_KEY"),
 		NetworkProxy:   firstEnv("NETWORK_PROXY", "TMDB_PROXY", "HTTPS_PROXY", "HTTP_PROXY"),
+		AIBaseURL:      env("AI_BASE_URL", "https://api.openai.com/v1"),
+		AIAPIKey:       os.Getenv("AI_API_KEY"),
+		AIModel:        env("AI_MODEL", "gpt-5.5"),
 		CloudDriveAddr: env("CLOUDDRIVE_ADDR", "http://localhost:19798"),
 		FrontendOrigin: env("FRONTEND_ORIGIN", "*"),
 		FrontendDir:    env("FRONTEND_DIR", "/app/public"),
