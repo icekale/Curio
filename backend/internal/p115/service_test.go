@@ -10,7 +10,7 @@ import (
 	"curio/internal/models"
 )
 
-func TestPlayURLForLinkNameUsesStableIDRouteWithoutToken(t *testing.T) {
+func TestPlayURLForLinkNameUsesReadableChineseRouteWithoutToken(t *testing.T) {
 	service := NewService(nil)
 	playURL, err := service.PlayURLForLinkName("link-1", "http://localhost:8080", "电影/敦刻尔克 (2017) - 2160p UHD HEVC DTS-HD MA.iso")
 	if err != nil {
@@ -19,14 +19,17 @@ func TestPlayURLForLinkNameUsesStableIDRouteWithoutToken(t *testing.T) {
 	if strings.Contains(playURL, "token=") {
 		t.Fatalf("expected token-free play url, got %q", playURL)
 	}
-	if strings.Contains(playURL, "电影") || strings.Contains(playURL, "%E6%") {
-		t.Fatalf("expected ascii id route for player compatibility, got %q", playURL)
+	if !strings.Contains(playURL, "电影/敦刻尔克") {
+		t.Fatalf("expected readable chinese route, got %q", playURL)
+	}
+	if strings.Contains(playURL, "id/link-1") {
+		t.Fatalf("expected readable route instead of id route, got %q", playURL)
 	}
 	if strings.Contains(playURL, " ") {
 		t.Fatalf("expected spaces to be escaped for player compatibility, got %q", playURL)
 	}
-	if playURL != "http://localhost:8080/play/115/id/link-1/link-1.iso" {
-		t.Fatalf("unexpected stable id route %q", playURL)
+	if playURL != "http://localhost:8080/play/115/电影/敦刻尔克%20(2017)%20-%202160p%20UHD%20HEVC%20DTS-HD%20MA.iso" {
+		t.Fatalf("unexpected readable route %q", playURL)
 	}
 }
 
@@ -58,6 +61,45 @@ func TestDirectURLTTLUpgradesLegacyDefault(t *testing.T) {
 	got := directURLTTL(models.P115Settings{DirectURLTTLSeconds: legacyDirectURLTTLSeconds})
 	if got != 50*time.Minute {
 		t.Fatalf("unexpected ttl %s", got)
+	}
+}
+
+func TestPreviewSamplesTakesFromEachLibraryBeforeFilling(t *testing.T) {
+	groups := []previewLibraryItems{
+		{Lib: LibraryConfig{CID: "cid-a"}, Items: []TreeItem{{RelativePath: "a1.mkv"}, {RelativePath: "a2.mkv"}, {RelativePath: "a3.mkv"}}},
+		{Lib: LibraryConfig{CID: "cid-b"}, Items: []TreeItem{{RelativePath: "b1.mkv"}}},
+		{Lib: LibraryConfig{CID: "cid-c"}, Items: []TreeItem{{RelativePath: "c1.mkv"}, {RelativePath: "c2.mkv"}}},
+	}
+
+	samples := previewSamples(groups, 5)
+	got := make([]string, 0, len(samples))
+	for _, sample := range samples {
+		got = append(got, groups[sample.GroupIndex].Lib.CID+":"+groups[sample.GroupIndex].Items[sample.ItemIndex].RelativePath)
+	}
+	want := []string{"cid-a:a1.mkv", "cid-b:b1.mkv", "cid-c:c1.mkv", "cid-a:a2.mkv", "cid-c:c2.mkv"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("unexpected samples %#v", got)
+	}
+}
+
+func TestOpenTokenNeedsRefreshUsesLastRefreshTime(t *testing.T) {
+	recent := time.Now().Add(-openTokenRefreshInterval / 2)
+	old := time.Now().Add(-openTokenRefreshInterval - time.Minute)
+
+	if openTokenNeedsRefresh(models.P115Settings{}) {
+		t.Fatal("settings without refresh token must not refresh")
+	}
+	if !openTokenNeedsRefresh(models.P115Settings{RefreshToken: "refresh"}) {
+		t.Fatal("missing access token should refresh when refresh token exists")
+	}
+	if !openTokenNeedsRefresh(models.P115Settings{AccessToken: "access", RefreshToken: "refresh"}) {
+		t.Fatal("missing refreshed_at should refresh")
+	}
+	if openTokenNeedsRefresh(models.P115Settings{AccessToken: "access", RefreshToken: "refresh", OpenTokenRefreshedAt: &recent}) {
+		t.Fatal("recently refreshed token should not refresh again")
+	}
+	if !openTokenNeedsRefresh(models.P115Settings{AccessToken: "access", RefreshToken: "refresh", OpenTokenRefreshedAt: &old}) {
+		t.Fatal("old token should refresh even when access token still exists")
 	}
 }
 
@@ -104,63 +146,57 @@ func TestLocalSTRMFilesFindsOnlySTRMUnderOutputPrefix(t *testing.T) {
 	}
 }
 
-func TestDesiredSTRMRelativePathsUsesMediaPathWithoutExportRoot(t *testing.T) {
+func TestSTRMPathsKeepExportRootDirectory(t *testing.T) {
+	settings := models.P115Settings{STRMOutputPath: t.TempDir()}
+	item := TreeItem{RelativePath: "日韩电影/小森林/小森林冬春篇.iso", Name: "小森林冬春篇.iso"}
+
+	target, err := strmPathFor(settings.STRMOutputPath, "", item.RelativePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(filepath.ToSlash(target), "/日韩电影/小森林/小森林冬春篇.strm") {
+		t.Fatalf("path should include export root directory, got %q", target)
+	}
+}
+
+func TestEnsureTreeItemsRootDirectoryPrefixesSelectedCIDName(t *testing.T) {
 	items := []TreeItem{
-		{RelativePath: "tv/A.mkv", Name: "A.mkv"},
-		{RelativePath: "movies/B.mp4", Name: "B.mp4"},
-		{RelativePath: "tv", Name: "tv", IsDirectory: true},
+		{RelativePath: "tv/数码宝贝 (1999)/Season 02/E01.mkv", Name: "E01.mkv"},
 	}
 
-	got := strings.Join(desiredSTRMRelativePaths(items), "|")
-	want := "tv/A.strm|movies/B.strm"
-	if got != want {
-		t.Fatalf("unexpected STRM paths %q", got)
+	got := ensureTreeItemsRootDirectory(items, "media")
+
+	if got[0].RelativePath != "media/tv/数码宝贝 (1999)/Season 02/E01.mkv" {
+		t.Fatalf("expected selected root directory in preview path, got %#v", got)
 	}
 }
 
-func TestLocalSTRMRelativePathsReturnsPathsUnderOutputPrefix(t *testing.T) {
-	root := t.TempDir()
-	target := filepath.Join(root, "prefix", "tv", "A.strm")
+func TestEnsureTreeItemsRootDirectoryKeepsExistingSelectedCIDName(t *testing.T) {
+	items := []TreeItem{
+		{RelativePath: "media/tv/数码宝贝 (1999)/Season 02/E01.mkv", Name: "E01.mkv"},
+	}
 
-	got := localSTRMRelativePaths(root, "prefix", map[string]string{
-		cleanPathKey(target): target,
-	})
+	got := ensureTreeItemsRootDirectory(items, "media")
 
-	if len(got) != 1 || got[0] != "tv/A.strm" {
-		t.Fatalf("unexpected local STRM relative paths %#v", got)
+	if got[0].RelativePath != items[0].RelativePath {
+		t.Fatalf("expected existing root directory to be preserved, got %#v", got)
 	}
 }
 
-func TestDetectRelativePrefixShiftCatchesAddedExportRoot(t *testing.T) {
-	prefix, matched, total, ok := detectRelativePrefixShift(
-		[]string{"tv/A.mkv", "movies/B.mkv", "collections/C.mkv"},
-		[]string{"media/tv/A.mkv", "media/movies/B.mkv", "media/collections/C.mkv"},
-	)
-
-	if !ok || prefix != "media" || matched != 3 || total != 3 {
-		t.Fatalf("expected media prefix shift, got prefix=%q matched=%d total=%d ok=%t", prefix, matched, total, ok)
+func TestPrepareTreeItemsDeduplicatesRelativePath(t *testing.T) {
+	items := []TreeItem{
+		{RelativePath: "媒体库/JAV/A/A-fanart.jpg", Name: "A-fanart.jpg"},
+		{RelativePath: "媒体库/JAV/A/A-fanart.jpg", Name: "A-fanart.jpg"},
+		{RelativePath: "媒体库/JAV/A/A.mp4", Name: "A.mp4"},
 	}
-}
 
-func TestDetectRelativePrefixShiftIgnoresUnchangedPaths(t *testing.T) {
-	_, _, _, ok := detectRelativePrefixShift(
-		[]string{"tv/A.mkv", "movies/B.mkv"},
-		[]string{"tv/A.mkv", "movies/B.mkv"},
-	)
+	prepared, snapshot := prepareTreeItems(LibraryConfig{CID: "cid-1"}, items, "v1")
 
-	if ok {
-		t.Fatal("unchanged paths must not look like a prefix shift")
+	if len(prepared) != 2 || len(snapshot) != 2 {
+		t.Fatalf("expected duplicate relative path to be skipped, got prepared=%d snapshot=%d", len(prepared), len(snapshot))
 	}
-}
-
-func TestDetectRelativePrefixShiftIgnoresUnrelatedChanges(t *testing.T) {
-	_, _, _, ok := detectRelativePrefixShift(
-		[]string{"tv/A.mkv", "movies/B.mkv", "collections/C.mkv"},
-		[]string{"tv/A-renamed.mkv", "movies/B.mkv", "extras/C.mkv"},
-	)
-
-	if ok {
-		t.Fatal("unrelated changes must not look like a prefix shift")
+	if prepared[0].RelativePath != "媒体库/JAV/A/A-fanart.jpg" || prepared[1].RelativePath != "媒体库/JAV/A/A.mp4" {
+		t.Fatalf("unexpected prepared items %#v", prepared)
 	}
 }
 

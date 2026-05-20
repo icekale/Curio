@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"path"
-	"sort"
 	"strings"
 	"time"
 
@@ -93,6 +92,7 @@ func (s *Store) Migrate(ctx context.Context) error {
 			emby_proxy_port INT NOT NULL DEFAULT 8097,
 			emby_proxy_base_path TEXT NOT NULL DEFAULT '/emby',
 			emby_api_key TEXT NOT NULL DEFAULT '',
+			open_token_refreshed_at TIMESTAMPTZ,
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
 		`ALTER TABLE p115_settings ADD COLUMN IF NOT EXISTS cookie_login_app TEXT NOT NULL DEFAULT 'wechatmini'`,
@@ -100,6 +100,7 @@ func (s *Store) Migrate(ctx context.Context) error {
 		`ALTER TABLE p115_settings ADD COLUMN IF NOT EXISTS sync_cron_enabled BOOLEAN NOT NULL DEFAULT false`,
 		`ALTER TABLE p115_settings ADD COLUMN IF NOT EXISTS sync_interval_minutes INT NOT NULL DEFAULT 60`,
 		`ALTER TABLE p115_settings ADD COLUMN IF NOT EXISTS library_cid TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE p115_settings ADD COLUMN IF NOT EXISTS open_token_refreshed_at TIMESTAMPTZ`,
 		`DO $$
 		BEGIN
 			IF EXISTS (
@@ -236,6 +237,27 @@ func (s *Store) Migrate(ctx context.Context) error {
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			UNIQUE(emby_server_id, emby_item_id)
 		)`,
+		`CREATE TABLE IF NOT EXISTS emby_playback_progress (
+			id TEXT PRIMARY KEY,
+			emby_server_id TEXT NOT NULL DEFAULT 'default',
+			user_id TEXT NOT NULL,
+			emby_item_id TEXT NOT NULL,
+			strm_link_id TEXT NOT NULL DEFAULT '',
+			position_ticks BIGINT NOT NULL DEFAULT 0,
+			duration_ticks BIGINT NOT NULL DEFAULT 0,
+			played BOOLEAN NOT NULL DEFAULT false,
+			client TEXT NOT NULL DEFAULT '',
+			device TEXT NOT NULL DEFAULT '',
+			play_session_id TEXT NOT NULL DEFAULT '',
+			last_event TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			cleared_at TIMESTAMPTZ,
+			UNIQUE(emby_server_id, user_id, emby_item_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_emby_playback_progress_recent
+			ON emby_playback_progress(emby_server_id, user_id, updated_at DESC)
+			WHERE cleared_at IS NULL AND played=false`,
 		`CREATE TABLE IF NOT EXISTS naming_templates (
 			template_type TEXT PRIMARY KEY,
 			name TEXT NOT NULL,
@@ -281,6 +303,7 @@ func (s *Store) Migrate(ctx context.Context) error {
 		)`,
 		`ALTER TABLE batches ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'local'`,
 		`CREATE INDEX IF NOT EXISTS idx_batches_active ON batches(status, ended_at) WHERE ended_at IS NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_batches_started ON batches(started_at DESC)`,
 		`CREATE TABLE IF NOT EXISTS media_files (
 			id TEXT PRIMARY KEY,
 			batch_id TEXT NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
@@ -524,6 +547,7 @@ func (s *Store) Migrate(ctx context.Context) error {
 			executed_at TIMESTAMPTZ
 		)`,
 		`ALTER TABLE organize_tasks ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now()`,
+		`CREATE INDEX IF NOT EXISTS idx_organize_tasks_log_time ON organize_tasks((COALESCE(executed_at, created_at)) DESC)`,
 		`CREATE TABLE IF NOT EXISTS operation_histories (
 			id TEXT PRIMARY KEY,
 			task_id TEXT NOT NULL DEFAULT '',
@@ -537,6 +561,7 @@ func (s *Store) Migrate(ctx context.Context) error {
 			error_message TEXT NOT NULL DEFAULT '',
 			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
+		`CREATE INDEX IF NOT EXISTS idx_operation_histories_created ON operation_histories(created_at DESC)`,
 		`CREATE TABLE IF NOT EXISTS collection_completion_histories (
 			id TEXT PRIMARY KEY,
 			collection_id INT NOT NULL,
@@ -547,6 +572,7 @@ func (s *Store) Migrate(ctx context.Context) error {
 			movie_count INT NOT NULL,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
+		`CREATE INDEX IF NOT EXISTS idx_collection_completion_histories_created ON collection_completion_histories(created_at DESC)`,
 		`UPDATE batches b SET
 			total=COALESCE((SELECT COUNT(*)::INT FROM media_files mf WHERE mf.batch_id=b.id), 0),
 			done=COALESCE((SELECT COUNT(*)::INT FROM media_files mf WHERE mf.batch_id=b.id AND mf.process_status='done'), 0),
@@ -688,15 +714,16 @@ func cloudDriveFromSystem(settings models.SystemSettings) models.CloudDriveSetti
 
 func (s *Store) P115Settings(ctx context.Context) (models.P115Settings, error) {
 	var settings models.P115Settings
+	var openTokenRefreshedAt sql.NullTime
 	err := s.db.QueryRow(ctx, `SELECT enabled, auth_mode, app_id, app_secret, access_token, refresh_token, cookies, cookie_login_app,
 		strm_output_path, public_base_url, direct_url_ttl_seconds, user_agent_mode, fixed_user_agent, library_cid,
 		delete_missing_strm, stale_before_delete, keep_deleted_days, refresh_emby_after_sync, sync_cron_enabled, sync_interval_minutes,
-		emby_upstream_url, emby_public_url, emby_proxy_port, emby_proxy_base_path, emby_api_key, updated_at
+		emby_upstream_url, emby_public_url, emby_proxy_port, emby_proxy_base_path, emby_api_key, open_token_refreshed_at, updated_at
 		FROM p115_settings WHERE id=1`).
 		Scan(&settings.Enabled, &settings.AuthMode, &settings.AppID, &settings.AppSecret, &settings.AccessToken, &settings.RefreshToken, &settings.Cookies, &settings.CookieLoginApp,
 			&settings.STRMOutputPath, &settings.PublicBaseURL, &settings.DirectURLTTLSeconds, &settings.UserAgentMode, &settings.FixedUserAgent, &settings.LibraryCID,
 			&settings.DeleteMissingSTRM, &settings.StaleBeforeDelete, &settings.KeepDeletedDays, &settings.RefreshEmbyAfterSync, &settings.SyncCronEnabled, &settings.SyncIntervalMinutes,
-			&settings.EmbyUpstreamURL, &settings.EmbyPublicURL, &settings.EmbyProxyPort, &settings.EmbyProxyBasePath, &settings.EmbyAPIKey, &settings.UpdatedAt)
+			&settings.EmbyUpstreamURL, &settings.EmbyPublicURL, &settings.EmbyProxyPort, &settings.EmbyProxyBasePath, &settings.EmbyAPIKey, &openTokenRefreshedAt, &settings.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		settings = models.P115Settings{
 			Enabled:             true,
@@ -716,7 +743,13 @@ func (s *Store) P115Settings(ctx context.Context) (models.P115Settings, error) {
 		}
 		return s.P115Settings(ctx)
 	}
-	return settings, err
+	if err != nil {
+		return settings, err
+	}
+	if openTokenRefreshedAt.Valid {
+		settings.OpenTokenRefreshedAt = &openTokenRefreshedAt.Time
+	}
+	return settings, nil
 }
 
 func (s *Store) SaveP115Settings(ctx context.Context, settings models.P115Settings) (models.P115Settings, error) {
@@ -724,17 +757,17 @@ func (s *Store) SaveP115Settings(ctx context.Context, settings models.P115Settin
 		id, enabled, auth_mode, app_id, app_secret, access_token, refresh_token, cookies, cookie_login_app,
 		strm_output_path, public_base_url, direct_url_ttl_seconds, user_agent_mode, fixed_user_agent, library_cid,
 		delete_missing_strm, stale_before_delete, keep_deleted_days, refresh_emby_after_sync, sync_cron_enabled, sync_interval_minutes,
-		emby_upstream_url, emby_public_url, emby_proxy_port, emby_proxy_base_path, emby_api_key
-	) VALUES (1,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
+		emby_upstream_url, emby_public_url, emby_proxy_port, emby_proxy_base_path, emby_api_key, open_token_refreshed_at
+	) VALUES (1,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
 	ON CONFLICT (id) DO UPDATE SET
 		enabled=$1, auth_mode=$2, app_id=$3, app_secret=$4, access_token=$5, refresh_token=$6, cookies=$7, cookie_login_app=$8,
 		strm_output_path=$9, public_base_url=$10, direct_url_ttl_seconds=$11, user_agent_mode=$12, fixed_user_agent=$13, library_cid=$14,
 		delete_missing_strm=$15, stale_before_delete=$16, keep_deleted_days=$17, refresh_emby_after_sync=$18, sync_cron_enabled=$19, sync_interval_minutes=$20,
-		emby_upstream_url=$21, emby_public_url=$22, emby_proxy_port=$23, emby_proxy_base_path=$24, emby_api_key=$25, updated_at=now()`,
+		emby_upstream_url=$21, emby_public_url=$22, emby_proxy_port=$23, emby_proxy_base_path=$24, emby_api_key=$25, open_token_refreshed_at=$26, updated_at=now()`,
 		settings.Enabled, settings.AuthMode, settings.AppID, settings.AppSecret, settings.AccessToken, settings.RefreshToken, settings.Cookies, settings.CookieLoginApp,
 		settings.STRMOutputPath, settings.PublicBaseURL, settings.DirectURLTTLSeconds, settings.UserAgentMode, settings.FixedUserAgent, settings.LibraryCID,
 		settings.DeleteMissingSTRM, settings.StaleBeforeDelete, settings.KeepDeletedDays, settings.RefreshEmbyAfterSync, settings.SyncCronEnabled, settings.SyncIntervalMinutes,
-		settings.EmbyUpstreamURL, settings.EmbyPublicURL, settings.EmbyProxyPort, settings.EmbyProxyBasePath, settings.EmbyAPIKey)
+		settings.EmbyUpstreamURL, settings.EmbyPublicURL, settings.EmbyProxyPort, settings.EmbyProxyBasePath, settings.EmbyAPIKey, settings.OpenTokenRefreshedAt)
 	if err != nil {
 		return models.P115Settings{}, err
 	}
@@ -1048,93 +1081,59 @@ func (s *Store) AttachAIFilenameLogFile(ctx context.Context, batchID, filePath, 
 	return err
 }
 
-func (s *Store) LogEntries(ctx context.Context, logType string, limit int) (models.LogPage, error) {
-	logType = strings.TrimSpace(logType)
-	if logType == "" {
-		logType = "all"
+func (s *Store) LogEntries(ctx context.Context, logType string, limit, offset int) (models.LogPage, error) {
+	logType = normalizeLogType(logType)
+	if limit <= 0 || limit > 1000 {
+		limit = 50
 	}
-	if limit <= 0 || limit > 500 {
-		limit = 200
+	if offset < 0 {
+		offset = 0
+	}
+	fragments := logQueryFragments(logType, false)
+	if len(fragments) == 0 {
+		return models.LogPage{Items: []models.LogEntry{}, Limit: limit, Offset: offset, Type: logType}, nil
+	}
+	union := strings.Join(fragments, "\nUNION ALL\n")
+	var total int
+	if err := s.db.QueryRow(ctx, `WITH logs AS (`+union+`) SELECT count(*) FROM logs`).Scan(&total); err != nil {
+		return models.LogPage{}, err
+	}
+	rows, err := s.db.Query(ctx, `WITH logs AS (`+union+`) SELECT id, type, source, status, message, detail,
+		batch_id, file_id, file_name, path, model, base_url, proxy_url, response_format,
+		request_json, response_json, parsed_json, http_status, duration_ms, error_message, created_at
+		FROM logs ORDER BY created_at DESC LIMIT $1 OFFSET $2`, limit, offset)
+	if err != nil {
+		return models.LogPage{}, err
 	}
 	entries := make([]models.LogEntry, 0, limit)
-	if includeLogType(logType, "ai_filename") {
-		rows, err := s.db.Query(ctx, `SELECT id, 'ai_filename', 'AI 文件名', status,
-			CASE WHEN status='success' THEN COALESCE(NULLIF(title, ''), file_name, file_path) ELSE 'AI 文件名识别失败' END,
-			reason, batch_id, file_id, file_name, file_path, model, base_url, proxy_url, response_format,
-			request_json, response_json, parsed_json, http_status, duration_ms, error_message, created_at
-			FROM ai_filename_logs ORDER BY created_at DESC LIMIT $1`, limit)
-		if err != nil {
-			return models.LogPage{}, err
-		}
-		if err := appendLogRows(rows, &entries); err != nil {
-			return models.LogPage{}, err
-		}
+	if err := appendLogRows(rows, &entries); err != nil {
+		return models.LogPage{}, err
 	}
-	if includeLogType(logType, "p115_sync") {
-		rows, err := s.db.Query(ctx, `SELECT id, 'p115_sync', '115 STRM', status,
-			concat(trigger, ' / ', COALESCE(NULLIF(mode, ''), '-'), ' / 生成 ', generated, ' 更新 ', updated_count, ' 删除 ', deleted_count, ' 失败 ', failed),
-			event_summary, '', '', '', tree_version, '', '', '', '', '', '', '', 0, duration_ms, error_message, started_at
-			FROM p115_sync_runs ORDER BY started_at DESC LIMIT $1`, limit)
-		if err != nil {
-			return models.LogPage{}, err
-		}
-		if err := appendLogRows(rows, &entries); err != nil {
-			return models.LogPage{}, err
-		}
+	return models.LogPage{Items: entries, Total: total, Limit: limit, Offset: offset, Type: logType}, nil
+}
+
+func (s *Store) LogEntry(ctx context.Context, id string) (models.LogEntry, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return models.LogEntry{}, pgx.ErrNoRows
 	}
-	if includeLogType(logType, "operation") {
-		rows, err := s.db.Query(ctx, `SELECT id, 'operation', '整理操作', operation_status, operation_name,
-			concat(source_path, ' -> ', target_path), batch_id, file_id, '', source_path, '', '', '', '',
-			'', '', '', 0, 0, error_message, created_at
-			FROM operation_histories ORDER BY created_at DESC LIMIT $1`, limit)
-		if err != nil {
-			return models.LogPage{}, err
-		}
-		if err := appendLogRows(rows, &entries); err != nil {
-			return models.LogPage{}, err
-		}
-		rows, err = s.db.Query(ctx, `SELECT id, 'organize_task', '整理任务', task_status, template_id,
-			concat(source_path, ' -> ', target_path), batch_id, file_id, '', source_path, '', '', '', '',
-			'', '', '', 0, 0, error_message, COALESCE(executed_at, created_at)
-			FROM organize_tasks ORDER BY COALESCE(executed_at, created_at) DESC LIMIT $1`, limit)
-		if err != nil {
-			return models.LogPage{}, err
-		}
-		if err := appendLogRows(rows, &entries); err != nil {
-			return models.LogPage{}, err
-		}
-		rows, err = s.db.Query(ctx, `SELECT id, 'collection_completion', '合集补齐', 'done', collection_name,
-			concat(source_path, ' -> ', target_path, ' / ', movie_count, ' 部'), '', '', '', source_path, '', '', '', '',
-			'', '', '', 0, 0, '', created_at
-			FROM collection_completion_histories ORDER BY created_at DESC LIMIT $1`, limit)
-		if err != nil {
-			return models.LogPage{}, err
-		}
-		if err := appendLogRows(rows, &entries); err != nil {
-			return models.LogPage{}, err
-		}
+	fragments := logQueryFragments("all", true)
+	union := strings.Join(fragments, "\nUNION ALL\n")
+	rows, err := s.db.Query(ctx, `WITH logs AS (`+union+`) SELECT id, type, source, status, message, detail,
+		batch_id, file_id, file_name, path, model, base_url, proxy_url, response_format,
+		request_json, response_json, parsed_json, http_status, duration_ms, error_message, created_at
+		FROM logs WHERE id=$1 ORDER BY created_at DESC LIMIT 1`, id)
+	if err != nil {
+		return models.LogEntry{}, err
 	}
-	if includeLogType(logType, "scan_batch") {
-		rows, err := s.db.Query(ctx, `SELECT id, 'scan_batch', '扫描批次', status,
-			concat(source, ' / 总数 ', total, ' 完成 ', done, ' 失败 ', failed, ' 缺失合集 ', incomplete_collection),
-			'', id, '', '', source, '', '', '', '', '', '', '', 0,
-			COALESCE((EXTRACT(EPOCH FROM (ended_at - started_at)) * 1000)::BIGINT, 0), '', started_at
-			FROM batches ORDER BY started_at DESC LIMIT $1`, limit)
-		if err != nil {
-			return models.LogPage{}, err
-		}
-		if err := appendLogRows(rows, &entries); err != nil {
-			return models.LogPage{}, err
-		}
+	entries := []models.LogEntry{}
+	if err := appendLogRows(rows, &entries); err != nil {
+		return models.LogEntry{}, err
 	}
-	sort.SliceStable(entries, func(i, j int) bool {
-		return entries[i].CreatedAt.After(entries[j].CreatedAt)
-	})
-	total := len(entries)
-	if len(entries) > limit {
-		entries = entries[:limit]
+	if len(entries) == 0 {
+		return models.LogEntry{}, pgx.ErrNoRows
 	}
-	return models.LogPage{Items: entries, Total: total, Limit: limit, Type: logType}, nil
+	return entries[0], nil
 }
 
 func (s *Store) ReplaceP115Snapshot(ctx context.Context, libraryCID, treeVersion string, items []models.P115TreeSnapshotItem) error {
@@ -1299,6 +1298,105 @@ func (s *Store) UpsertEmbySTRMItem(ctx context.Context, item models.EmbySTRMItem
 			strm_link_id=$4, strm_path=$5, status=$6, last_seen_at=now(), updated_at=now()`,
 		item.ID, item.EmbyServerID, item.EmbyItemID, item.STRMLinkID, item.STRMPath, item.Status)
 	return err
+}
+
+func (s *Store) UpsertEmbyPlaybackProgress(ctx context.Context, progress models.EmbyPlaybackProgress) error {
+	progress.EmbyServerID = strings.TrimSpace(progress.EmbyServerID)
+	if progress.EmbyServerID == "" {
+		progress.EmbyServerID = "default"
+	}
+	progress.UserID = strings.TrimSpace(progress.UserID)
+	progress.EmbyItemID = strings.TrimSpace(progress.EmbyItemID)
+	if progress.UserID == "" || progress.EmbyItemID == "" {
+		return nil
+	}
+	if strings.TrimSpace(progress.ID) == "" {
+		progress.ID = progress.EmbyServerID + ":" + progress.UserID + ":" + progress.EmbyItemID
+	}
+	_, err := s.db.Exec(ctx, `INSERT INTO emby_playback_progress
+		(id, emby_server_id, user_id, emby_item_id, strm_link_id, position_ticks, duration_ticks, played, client, device, play_session_id, last_event)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+		ON CONFLICT (emby_server_id, user_id, emby_item_id) DO UPDATE SET
+			strm_link_id=EXCLUDED.strm_link_id,
+			position_ticks=EXCLUDED.position_ticks,
+			duration_ticks=CASE
+				WHEN EXCLUDED.duration_ticks > 0 THEN EXCLUDED.duration_ticks
+				ELSE emby_playback_progress.duration_ticks
+			END,
+			played=EXCLUDED.played,
+			client=EXCLUDED.client,
+			device=EXCLUDED.device,
+			play_session_id=EXCLUDED.play_session_id,
+			last_event=EXCLUDED.last_event,
+			cleared_at=NULL,
+			updated_at=now()`,
+		progress.ID, progress.EmbyServerID, progress.UserID, progress.EmbyItemID, progress.STRMLinkID,
+		progress.PositionTicks, progress.DurationTicks, progress.Played, progress.Client, progress.Device,
+		progress.PlaySessionID, progress.LastEvent)
+	return err
+}
+
+func (s *Store) ClearEmbyPlaybackProgress(ctx context.Context, serverID, userID, itemID, event string) error {
+	serverID = strings.TrimSpace(serverID)
+	if serverID == "" {
+		serverID = "default"
+	}
+	userID = strings.TrimSpace(userID)
+	itemID = strings.TrimSpace(itemID)
+	if userID == "" || itemID == "" {
+		return nil
+	}
+	event = strings.TrimSpace(event)
+	if event == "" {
+		event = "clear"
+	}
+	_, err := s.db.Exec(ctx, `UPDATE emby_playback_progress
+		SET position_ticks=0, played=false, last_event=$4, cleared_at=now(), updated_at=now()
+		WHERE emby_server_id=$1 AND user_id=$2 AND emby_item_id=$3`,
+		serverID, userID, itemID, event)
+	return err
+}
+
+func (s *Store) RecentEmbyPlaybackProgress(ctx context.Context, serverID, userID string, limit int) ([]models.EmbyPlaybackProgress, error) {
+	serverID = strings.TrimSpace(serverID)
+	if serverID == "" {
+		serverID = "default"
+	}
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return nil, nil
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	rows, err := s.db.Query(ctx, `SELECT id, emby_server_id, user_id, emby_item_id, strm_link_id,
+			position_ticks, duration_ticks, played, client, device, play_session_id, last_event, updated_at, cleared_at
+		FROM emby_playback_progress
+		WHERE emby_server_id=$1 AND user_id=$2 AND cleared_at IS NULL AND played=false AND position_ticks > 0
+		ORDER BY updated_at DESC
+		LIMIT $3`, serverID, userID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	progresses := make([]models.EmbyPlaybackProgress, 0)
+	for rows.Next() {
+		var progress models.EmbyPlaybackProgress
+		var clearedAt sql.NullTime
+		if err := rows.Scan(&progress.ID, &progress.EmbyServerID, &progress.UserID, &progress.EmbyItemID, &progress.STRMLinkID,
+			&progress.PositionTicks, &progress.DurationTicks, &progress.Played, &progress.Client, &progress.Device,
+			&progress.PlaySessionID, &progress.LastEvent, &progress.UpdatedAt, &clearedAt); err != nil {
+			return nil, err
+		}
+		if clearedAt.Valid {
+			progress.ClearedAt = &clearedAt.Time
+		}
+		progresses = append(progresses, progress)
+	}
+	return progresses, rows.Err()
 }
 
 func (s *Store) Directories(ctx context.Context) (models.DirectoryConfig, error) {
@@ -2519,17 +2617,74 @@ func appendLogRows(rows pgx.Rows, entries *[]models.LogEntry) error {
 	return rows.Err()
 }
 
-func includeLogType(filter, kind string) bool {
-	switch filter {
-	case "", "all":
-		return true
-	case "operation":
-		return kind == "operation"
-	case "scan":
-		return kind == "scan_batch"
-	default:
-		return filter == kind
+func normalizeLogType(logType string) string {
+	logType = strings.TrimSpace(logType)
+	if logType == "" {
+		return "all"
 	}
+	if logType == "scan" {
+		return "scan_batch"
+	}
+	return logType
+}
+
+func logQueryFragments(logType string, includePayloads bool) []string {
+	logType = normalizeLogType(logType)
+	payloadJSON := `''`
+	if includePayloads {
+		payloadJSON = `request_json`
+	}
+	responseJSON := `''`
+	if includePayloads {
+		responseJSON = `response_json`
+	}
+	parsedJSON := `''`
+	if includePayloads {
+		parsedJSON = `parsed_json`
+	}
+	fragments := []string{}
+	if logType == "all" || logType == "ai_filename" {
+		fragments = append(fragments, `SELECT id, 'ai_filename' AS type, 'AI 文件名' AS source, status,
+			CASE WHEN status='success' THEN COALESCE(NULLIF(title, ''), file_name, file_path) ELSE 'AI 文件名识别失败' END AS message,
+			reason AS detail, batch_id, file_id, file_name, file_path AS path, model, base_url, proxy_url, response_format,
+			`+payloadJSON+` AS request_json, `+responseJSON+` AS response_json, `+parsedJSON+` AS parsed_json,
+			http_status, duration_ms, error_message, created_at
+			FROM ai_filename_logs`)
+	}
+	if logType == "all" || logType == "p115_sync" {
+		fragments = append(fragments, `SELECT id, 'p115_sync' AS type, '115 STRM' AS source, status,
+			concat(trigger, ' / ', COALESCE(NULLIF(mode, ''), '-'), ' / 生成 ', generated, ' 更新 ', updated_count, ' 删除 ', deleted_count, ' 失败 ', failed) AS message,
+			event_summary AS detail, '' AS batch_id, '' AS file_id, '' AS file_name, tree_version AS path, '' AS model,
+			'' AS base_url, '' AS proxy_url, '' AS response_format, '' AS request_json, '' AS response_json, '' AS parsed_json,
+			0 AS http_status, duration_ms, error_message, started_at AS created_at
+			FROM p115_sync_runs`)
+	}
+	if logType == "all" || logType == "operation" {
+		fragments = append(fragments, `SELECT id, 'operation' AS type, '整理操作' AS source, operation_status AS status, operation_name AS message,
+			concat(source_path, ' -> ', target_path) AS detail, batch_id, file_id, '' AS file_name, source_path AS path, '' AS model,
+			'' AS base_url, '' AS proxy_url, '' AS response_format, '' AS request_json, '' AS response_json, '' AS parsed_json,
+			0 AS http_status, 0 AS duration_ms, error_message, created_at
+			FROM operation_histories`)
+		fragments = append(fragments, `SELECT id, 'organize_task' AS type, '整理任务' AS source, task_status AS status, template_id AS message,
+			concat(source_path, ' -> ', target_path) AS detail, batch_id, file_id, '' AS file_name, source_path AS path, '' AS model,
+			'' AS base_url, '' AS proxy_url, '' AS response_format, '' AS request_json, '' AS response_json, '' AS parsed_json,
+			0 AS http_status, 0 AS duration_ms, error_message, COALESCE(executed_at, created_at) AS created_at
+			FROM organize_tasks`)
+		fragments = append(fragments, `SELECT id, 'collection_completion' AS type, '合集补齐' AS source, 'done' AS status, collection_name AS message,
+			concat(source_path, ' -> ', target_path, ' / ', movie_count, ' 部') AS detail, '' AS batch_id, '' AS file_id,
+			'' AS file_name, source_path AS path, '' AS model, '' AS base_url, '' AS proxy_url, '' AS response_format,
+			'' AS request_json, '' AS response_json, '' AS parsed_json, 0 AS http_status, 0 AS duration_ms, '' AS error_message, created_at
+			FROM collection_completion_histories`)
+	}
+	if logType == "all" || logType == "scan_batch" {
+		fragments = append(fragments, `SELECT id, 'scan_batch' AS type, '扫描批次' AS source, status,
+			concat(source, ' / 总数 ', total, ' 完成 ', done, ' 失败 ', failed, ' 缺失合集 ', incomplete_collection) AS message,
+			'' AS detail, id AS batch_id, '' AS file_id, '' AS file_name, source AS path, '' AS model, '' AS base_url,
+			'' AS proxy_url, '' AS response_format, '' AS request_json, '' AS response_json, '' AS parsed_json, 0 AS http_status,
+			COALESCE((EXTRACT(EPOCH FROM (ended_at - started_at)) * 1000)::BIGINT, 0) AS duration_ms, '' AS error_message, started_at AS created_at
+			FROM batches`)
+	}
+	return fragments
 }
 
 func scanMediaFile(rows pgx.Rows) (models.MediaFile, error) {

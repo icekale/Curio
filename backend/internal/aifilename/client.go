@@ -8,10 +8,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"time"
+
+	"curio/internal/netproxy"
 )
 
 const (
@@ -301,15 +302,7 @@ func chatCompletionsURL(baseURL string) string {
 }
 
 func httpClient(proxyURL string) (*http.Client, error) {
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	if strings.TrimSpace(proxyURL) != "" {
-		parsed, err := url.Parse(strings.TrimSpace(proxyURL))
-		if err != nil {
-			return nil, err
-		}
-		transport.Proxy = http.ProxyURL(parsed)
-	}
-	return &http.Client{Transport: transport, Timeout: 60 * time.Second}, nil
+	return netproxy.HTTPClient(proxyURL, 60*time.Second)
 }
 
 func jsonSchemaResponseFormat() map[string]any {

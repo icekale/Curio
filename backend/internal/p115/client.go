@@ -79,6 +79,14 @@ type openTokenPair struct {
 	RefreshToken string
 }
 
+type openTokenRefreshFunc func(context.Context, models.P115Settings) (models.P115Settings, error)
+
+type openAuthError struct {
+	message string
+}
+
+func (e openAuthError) Error() string { return e.message }
+
 type rateLimitError struct {
 	message string
 }
@@ -141,13 +149,19 @@ const (
 var errExportTreePending = errors.New("115 目录树导出仍在准备中")
 
 type Client struct {
-	settings models.P115Settings
-	http     *http.Client
+	settings         models.P115Settings
+	http             *http.Client
+	openTokenRefresh openTokenRefreshFunc
 }
 
 func NewClient(settings models.P115Settings) *Client {
+	return NewClientWithTokenRefresh(settings, nil)
+}
+
+func NewClientWithTokenRefresh(settings models.P115Settings, refresh openTokenRefreshFunc) *Client {
 	return &Client{
-		settings: settings,
+		settings:         settings,
+		openTokenRefresh: refresh,
 		http: &http.Client{
 			Timeout: 60 * time.Second,
 		},
@@ -166,19 +180,18 @@ func (c *Client) Status(ctx context.Context) (models.P115Status, error) {
 	}
 	messages := make([]string, 0, 2)
 	if c.hasCookies() {
-		if _, err := c.listCookie(ctx, "0"); err != nil {
-			status.CookieError = "Cookies 列目录失败：" + err.Error()
-		} else if lib, err := ParseLibraryCID(c.settings.LibraryCID); err != nil {
-			status.CookieError = err.Error()
-		} else if err := c.CheckExportTree(ctx, lib); err != nil {
-			status.CookieError = "Cookies 目录树导出失败：" + err.Error()
+		if userName, err := c.cookieUserName(ctx); err != nil {
+			status.CookieError = "Cookies 用户校验失败：" + err.Error()
 		} else {
 			status.CookieValid = true
 			status.CanExport = true
-			messages = append(messages, "Cookies 可导出目录树")
+			if status.UserName == "" {
+				status.UserName = userName
+			}
+			messages = append(messages, "Cookies 有效")
 		}
 	} else {
-		status.CookieError = "未配置 Cookies，STRM 同步需要 Cookies 目录树导出"
+		messages = append(messages, "Cookies 未配置")
 	}
 	if c.hasOpenToken() {
 		payload, _, err := c.requestJSON(ctx, http.MethodGet, "https://proapi.115.com/open/user/info", nil, true, "")
@@ -187,15 +200,19 @@ func (c *Client) Status(ctx context.Context) (models.P115Status, error) {
 		} else if err := payloadError(payload); err != nil {
 			status.TokenError = "Open Token 校验失败：" + err.Error()
 		} else {
-			status.TokenValid = true
-			status.UserName = firstString(payload, "user_name", "name", "nickname", "uid")
-			messages = append(messages, "Open Token 有效")
+			if userName := userNameFromPayload(payload); userName != "" {
+				status.TokenValid = true
+				status.UserName = userName
+				messages = append(messages, "Open Token 有效")
+			} else {
+				status.TokenError = "Open Token 用户校验失败：115 未返回用户名"
+			}
 		}
 	} else {
 		messages = append(messages, "Open Token 未配置，播放直链将使用 Cookies")
 	}
 	status.CanPlay = status.CookieValid || status.TokenValid
-	status.Ready = status.CanExport && status.CanPlay && (!c.hasOpenToken() || status.TokenValid)
+	status.Ready = status.CanPlay
 	if status.CookieError != "" {
 		messages = append(messages, status.CookieError)
 	}
@@ -207,6 +224,47 @@ func (c *Client) Status(ctx context.Context) (models.P115Status, error) {
 	}
 	status.Message = strings.Join(messages, "；")
 	return status, nil
+}
+
+func (c *Client) cookieUserName(ctx context.Context) (string, error) {
+	endpoints := []string{
+		"https://my.115.com/?ct=ajax&ac=nav",
+		"https://webapi.115.com/user/info",
+		"https://115.com/?ct=ajax&ac=nav",
+	}
+	var lastErr error
+	for _, endpoint := range endpoints {
+		payload, _, err := c.requestJSON(ctx, http.MethodGet, endpoint, nil, false, "")
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if name := userNameFromPayload(payload); name != "" {
+			return name, nil
+		}
+		lastErr = errors.New("115 未返回用户名")
+	}
+	if lastErr != nil {
+		return "", lastErr
+	}
+	return "", errors.New("115 未返回用户名")
+}
+
+func userNameFromPayload(payload map[string]any) string {
+	for _, row := range []map[string]any{
+		payload,
+		asMap(payload["data"]),
+		asMap(payload["user"]),
+		asMap(asMap(payload["data"])["user"]),
+	} {
+		if len(row) == 0 {
+			continue
+		}
+		if name := firstString(row, "user_name", "userName", "username", "name", "nickname", "nick_name", "uid", "user_id"); name != "" {
+			return name
+		}
+	}
+	return ""
 }
 
 func (c *Client) StartOpenQRCode(ctx context.Context, codeChallenge string) (openQRCodeSession, error) {
@@ -451,6 +509,17 @@ func (c *Client) ResolvePath(ctx context.Context, cid, relativePath string) (Fil
 	if len(segments) == 0 {
 		return FileInfo{}, errors.New("115 相对路径为空")
 	}
+	info, err := c.resolvePathSegments(ctx, cid, segments, relativePath)
+	if err == nil || len(segments) <= 1 {
+		return info, err
+	}
+	if fallback, fallbackErr := c.resolvePathSegments(ctx, cid, segments[1:], relativePath); fallbackErr == nil {
+		return fallback, nil
+	}
+	return info, err
+}
+
+func (c *Client) resolvePathSegments(ctx context.Context, cid string, segments []string, displayPath string) (FileInfo, error) {
 	current := strings.TrimSpace(cid)
 	for index, name := range segments {
 		children, err := c.List(ctx, current)
@@ -465,11 +534,11 @@ func (c *Client) ResolvePath(ctx context.Context, cid, relativePath string) (Fil
 			}
 		}
 		if match == nil {
-			return FileInfo{}, fmt.Errorf("115 路径不存在：%s", relativePath)
+			return FileInfo{}, fmt.Errorf("115 路径不存在：%s", displayPath)
 		}
 		if index == len(segments)-1 {
 			if match.IsDirectory {
-				return FileInfo{}, fmt.Errorf("115 路径不是文件：%s", relativePath)
+				return FileInfo{}, fmt.Errorf("115 路径不是文件：%s", displayPath)
 			}
 			return *match, nil
 		}
@@ -478,7 +547,7 @@ func (c *Client) ResolvePath(ctx context.Context, cid, relativePath string) (Fil
 		}
 		current = match.ID
 	}
-	return FileInfo{}, fmt.Errorf("115 路径不存在：%s", relativePath)
+	return FileInfo{}, fmt.Errorf("115 路径不存在：%s", displayPath)
 }
 
 func (c *Client) List(ctx context.Context, cid string) ([]FileInfo, error) {
@@ -829,7 +898,8 @@ func (c *Client) exportTreeByWeb(ctx context.Context, lib LibraryConfig) ([]Tree
 	if err != nil {
 		return nil, err
 	}
-	return stripExportRootDirectory(items), nil
+	rootName, _ := c.directoryName(ctx, lib.CID)
+	return normalizeExportRootDirectory(items, rootName), nil
 }
 
 func (c *Client) createExportTreeTask(ctx context.Context, lib LibraryConfig, layerLimit int, action string) (map[string]any, error) {
@@ -1000,6 +1070,41 @@ func (c *Client) listAPS(ctx context.Context, cid string) ([]FileInfo, error) {
 	return c.listPaged(ctx, "https://aps.115.com/natsort/files.php", cid, false, 1200)
 }
 
+func (c *Client) directoryName(ctx context.Context, cid string) (string, error) {
+	cid = strings.TrimSpace(cid)
+	if cid == "" {
+		return "", errors.New("115 目录 ID 为空")
+	}
+	if c.hasCookies() {
+		name, err := c.directoryNameFromEndpoint(ctx, "https://webapi.115.com/files", cid, false)
+		if err == nil && name != "" {
+			return name, nil
+		}
+		if !c.hasOpenToken() && err != nil {
+			return "", err
+		}
+	}
+	if c.hasOpenToken() {
+		return c.directoryNameFromEndpoint(ctx, "https://proapi.115.com/open/ufile/files", cid, true)
+	}
+	return "", errors.New("115 未配置可用授权")
+}
+
+func (c *Client) directoryNameFromEndpoint(ctx context.Context, endpoint, cid string, open bool) (string, error) {
+	query := url.Values{}
+	query.Set("cid", cid)
+	query.Set("limit", "1")
+	query.Set("offset", "0")
+	query.Set("show_dir", "1")
+	query.Set("count_folders", "1")
+	query.Set("record_open_time", "0")
+	payload, _, err := c.requestJSON(ctx, http.MethodGet, endpoint, query, open, "")
+	if err != nil {
+		return "", err
+	}
+	return directoryNameFromPayload(payload, cid), nil
+}
+
 func (c *Client) listPaged(ctx context.Context, endpoint, cid string, open bool, pageSize int) ([]FileInfo, error) {
 	if pageSize <= 0 {
 		pageSize = 1150
@@ -1123,6 +1228,17 @@ func (c *Client) directURLWeb(ctx context.Context, pickcode, userAgentValue stri
 }
 
 func (c *Client) requestJSON(ctx context.Context, method, rawURL string, values url.Values, open bool, userAgentValue string) (map[string]any, http.Header, error) {
+	payload, header, err := c.requestJSONOnce(ctx, method, rawURL, values, open, userAgentValue)
+	if err == nil || !open || c.openTokenRefresh == nil || !isOpenAuthError(err) {
+		return payload, header, err
+	}
+	if refreshErr := c.refreshOpenTokenAfterAuthError(ctx); refreshErr != nil {
+		return nil, header, fmt.Errorf("%w；自动刷新 Open Token 失败：%v", err, refreshErr)
+	}
+	return c.requestJSONOnce(ctx, method, rawURL, values, open, userAgentValue)
+}
+
+func (c *Client) requestJSONOnce(ctx context.Context, method, rawURL string, values url.Values, open bool, userAgentValue string) (map[string]any, http.Header, error) {
 	reqURL := rawURL
 	var body io.Reader
 	if method == http.MethodGet {
@@ -1160,6 +1276,9 @@ func (c *Client) requestJSON(ctx context.Context, method, rawURL string, values 
 		if resp.StatusCode == http.StatusTooManyRequests {
 			return nil, resp.Header, rateLimitError{message: "115 请求失败：已达到当前访问上限，请稍后再试"}
 		}
+		if open && resp.StatusCode == http.StatusUnauthorized {
+			return nil, resp.Header, openAuthError{message: "115 Open Token 已失效：HTTP 401"}
+		}
 		return nil, resp.Header, fmt.Errorf("115 请求失败：HTTP %d", resp.StatusCode)
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
@@ -1173,9 +1292,24 @@ func (c *Client) requestJSON(ctx context.Context, method, rawURL string, values 
 		if isRateLimitMessage(message) {
 			return nil, resp.Header, rateLimitError{message: "115 请求失败：" + message}
 		}
+		if open && openAuthCode(payload) {
+			return nil, resp.Header, openAuthError{message: "115 Open Token 已失效：" + message}
+		}
 		return nil, resp.Header, fmt.Errorf("115 请求失败：%s", message)
 	}
+	if open && openAuthCode(payload) {
+		return nil, resp.Header, openAuthError{message: "115 Open Token 已失效：" + responseMessage(payload)}
+	}
 	return payload, resp.Header, nil
+}
+
+func (c *Client) refreshOpenTokenAfterAuthError(ctx context.Context) error {
+	next, err := c.openTokenRefresh(ctx, c.settings)
+	if err != nil {
+		return err
+	}
+	c.settings = next
+	return nil
 }
 
 func (c *Client) requestJSONWithRateLimitRetry(ctx context.Context, method, rawURL string, values url.Values, open bool, userAgentValue, action string) (map[string]any, http.Header, error) {
@@ -1332,11 +1466,12 @@ func parseExportTree(data []byte) ([]TreeItem, error) {
 		if strings.TrimSpace(line) == "" {
 			continue
 		}
-		idx := strings.LastIndex(line, "|-")
+		idx, markerLen := exportTreeMarker(line)
 		if idx < 0 {
 			continue
 		}
-		name := strings.TrimSpace(strings.TrimPrefix(line[idx+2:], "-"))
+		name := strings.TrimLeft(line[idx+markerLen:], "-—")
+		name = strings.TrimSpace(name)
 		if name == "" {
 			continue
 		}
@@ -1375,12 +1510,60 @@ func parseExportTree(data []byte) ([]TreeItem, error) {
 	return items, nil
 }
 
-func stripExportRootDirectory(items []TreeItem) []TreeItem {
+func exportTreeMarker(line string) (int, int) {
+	markers := []string{"|--", "|——", "|—", "|-"}
+	bestIndex := -1
+	bestLen := 0
+	for _, marker := range markers {
+		if index := strings.LastIndex(line, marker); index >= 0 && index >= bestIndex {
+			bestIndex = index
+			bestLen = len(marker)
+		}
+	}
+	return bestIndex, bestLen
+}
+
+func normalizeExportRootDirectory(items []TreeItem, selectedRootName string) []TreeItem {
 	if len(items) == 0 {
 		return items
 	}
+	selectedRootName = normalizedRelativePath(selectedRootName)
+	if selectedRootName == "" {
+		return items
+	}
+	items = stripExportRootWrapper(items, selectedRootName)
+	if exportTreeHasRoot(items, selectedRootName) {
+		return items
+	}
+	return prefixExportRootDirectory(items, selectedRootName)
+}
+
+func stripExportRootWrapper(items []TreeItem, selectedRootName string) []TreeItem {
+	root, ok := singleTopLevelRoot(items)
+	if !ok || root == "" || root == selectedRootName {
+		return items
+	}
+	prefix := root + "/" + selectedRootName
+	for _, item := range items {
+		if item.RelativePath == prefix || strings.HasPrefix(item.RelativePath, prefix+"/") {
+			return stripSingleExportRoot(items, root)
+		}
+	}
+	return items
+}
+
+func exportTreeHasRoot(items []TreeItem, selectedRootName string) bool {
+	for _, item := range items {
+		parts := splitRelativePath(item.RelativePath)
+		if len(parts) > 0 && parts[0] != selectedRootName {
+			return false
+		}
+	}
+	return true
+}
+
+func singleTopLevelRoot(items []TreeItem) (string, bool) {
 	root := ""
-	hasRootNode := false
 	for _, item := range items {
 		parts := splitRelativePath(item.RelativePath)
 		if len(parts) == 0 {
@@ -1388,32 +1571,91 @@ func stripExportRootDirectory(items []TreeItem) []TreeItem {
 		}
 		if root == "" {
 			root = parts[0]
-		} else if root != parts[0] {
-			return items
+			continue
 		}
-		if len(parts) == 1 && item.IsDirectory {
-			hasRootNode = true
+		if root != parts[0] {
+			return "", false
 		}
 	}
-	if root == "" || !hasRootNode {
-		return items
-	}
+	return root, root != ""
+}
+
+func stripSingleExportRoot(items []TreeItem, root string) []TreeItem {
 	stripped := make([]TreeItem, 0, len(items)-1)
-	prefix := root + "/"
+	wrapperPrefix := root + "/"
 	for _, item := range items {
 		if item.RelativePath == root {
 			continue
 		}
-		if !strings.HasPrefix(item.RelativePath, prefix) {
+		if !strings.HasPrefix(item.RelativePath, wrapperPrefix) {
 			return items
 		}
-		item.RelativePath = strings.TrimPrefix(item.RelativePath, prefix)
-		if item.Depth > 0 {
-			item.Depth--
-		}
+		item.RelativePath = strings.TrimPrefix(item.RelativePath, wrapperPrefix)
+		item.Depth = len(splitRelativePath(item.RelativePath))
 		stripped = append(stripped, item)
 	}
 	return stripped
+}
+
+func prefixExportRootDirectory(items []TreeItem, selectedRootName string) []TreeItem {
+	prefixed := make([]TreeItem, 0, len(items))
+	for _, item := range items {
+		relativePath := normalizedRelativePath(item.RelativePath)
+		if relativePath == "" {
+			item.RelativePath = selectedRootName
+		} else {
+			item.RelativePath = selectedRootName + "/" + relativePath
+		}
+		item.Depth = len(splitRelativePath(item.RelativePath))
+		prefixed = append(prefixed, item)
+	}
+	return prefixed
+}
+
+func directoryNameFromPayload(payload map[string]any, cid string) string {
+	cid = strings.TrimSpace(cid)
+	if cid == "" {
+		return ""
+	}
+	for _, row := range directoryPathRows(payload) {
+		id := firstString(row, "cid", "file_id", "fid", "id")
+		if id == cid {
+			if name := firstString(row, "name", "file_name", "n", "fn"); name != "" {
+				return name
+			}
+		}
+	}
+	rows := directoryPathRows(payload)
+	for index := len(rows) - 1; index >= 0; index-- {
+		if name := firstString(rows[index], "name", "file_name", "n", "fn"); name != "" {
+			return name
+		}
+	}
+	for _, row := range []map[string]any{payload, asMap(payload["data"])} {
+		if len(row) == 0 {
+			continue
+		}
+		if name := firstString(row, "current_name", "folder_name", "file_name", "name"); name != "" {
+			return name
+		}
+	}
+	return ""
+}
+
+func directoryPathRows(payload map[string]any) []map[string]any {
+	for _, row := range []map[string]any{payload, asMap(payload["data"])} {
+		for _, key := range []string{"path", "paths", "path_info", "breadcrumb", "breadcrumbs"} {
+			switch value := row[key].(type) {
+			case []any:
+				return mapsFromArray(value)
+			case map[string]any:
+				if rows := directoryPathRows(value); len(rows) > 0 {
+					return rows
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func splitRelativePath(value string) []string {
@@ -1672,6 +1914,16 @@ func responseOK(payload map[string]any) bool {
 	default:
 		return true
 	}
+}
+
+func openAuthCode(payload map[string]any) bool {
+	code := firstString(payload, "code", "errno", "errNo", "errcode")
+	return code == "99" || strings.HasPrefix(code, "401")
+}
+
+func isOpenAuthError(err error) bool {
+	var target openAuthError
+	return errors.As(err, &target)
 }
 
 func responseMessage(payload map[string]any) string {

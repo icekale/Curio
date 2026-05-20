@@ -150,32 +150,33 @@ type CloudDriveSettings struct {
 }
 
 type P115Settings struct {
-	Enabled              bool      `json:"enabled"`
-	AuthMode             string    `json:"-"`
-	AppID                string    `json:"app_id"`
-	AppSecret            string    `json:"app_secret"`
-	AccessToken          string    `json:"-"`
-	RefreshToken         string    `json:"-"`
-	Cookies              string    `json:"cookies"`
-	CookieLoginApp       string    `json:"cookie_login_app"`
-	STRMOutputPath       string    `json:"strm_output_path"`
-	PublicBaseURL        string    `json:"public_base_url"`
-	DirectURLTTLSeconds  int       `json:"-"`
-	UserAgentMode        string    `json:"-"`
-	FixedUserAgent       string    `json:"-"`
-	LibraryCID           string    `json:"library_cid"`
-	DeleteMissingSTRM    bool      `json:"delete_missing_strm"`
-	StaleBeforeDelete    bool      `json:"stale_before_delete"`
-	KeepDeletedDays      int       `json:"-"`
-	RefreshEmbyAfterSync bool      `json:"refresh_emby_after_sync"`
-	SyncCronEnabled      bool      `json:"sync_cron_enabled"`
-	SyncIntervalMinutes  int       `json:"sync_interval_minutes"`
-	EmbyUpstreamURL      string    `json:"emby_upstream_url"`
-	EmbyPublicURL        string    `json:"emby_public_url"`
-	EmbyProxyPort        int       `json:"emby_proxy_port"`
-	EmbyProxyBasePath    string    `json:"emby_proxy_base_path"`
-	EmbyAPIKey           string    `json:"emby_api_key"`
-	UpdatedAt            time.Time `json:"updated_at"`
+	Enabled              bool       `json:"enabled"`
+	AuthMode             string     `json:"-"`
+	AppID                string     `json:"app_id"`
+	AppSecret            string     `json:"app_secret"`
+	AccessToken          string     `json:"-"`
+	RefreshToken         string     `json:"-"`
+	OpenTokenRefreshedAt *time.Time `json:"-"`
+	Cookies              string     `json:"cookies"`
+	CookieLoginApp       string     `json:"cookie_login_app"`
+	STRMOutputPath       string     `json:"strm_output_path"`
+	PublicBaseURL        string     `json:"public_base_url"`
+	DirectURLTTLSeconds  int        `json:"-"`
+	UserAgentMode        string     `json:"-"`
+	FixedUserAgent       string     `json:"-"`
+	LibraryCID           string     `json:"library_cid"`
+	DeleteMissingSTRM    bool       `json:"delete_missing_strm"`
+	StaleBeforeDelete    bool       `json:"stale_before_delete"`
+	KeepDeletedDays      int        `json:"-"`
+	RefreshEmbyAfterSync bool       `json:"refresh_emby_after_sync"`
+	SyncCronEnabled      bool       `json:"sync_cron_enabled"`
+	SyncIntervalMinutes  int        `json:"sync_interval_minutes"`
+	EmbyUpstreamURL      string     `json:"emby_upstream_url"`
+	EmbyPublicURL        string     `json:"emby_public_url"`
+	EmbyProxyPort        int        `json:"emby_proxy_port"`
+	EmbyProxyBasePath    string     `json:"emby_proxy_base_path"`
+	EmbyAPIKey           string     `json:"emby_api_key"`
+	UpdatedAt            time.Time  `json:"updated_at"`
 }
 
 type P115Status struct {
@@ -255,6 +256,23 @@ type STRMSyncResult struct {
 	Failed       int    `json:"failed"`
 }
 
+type STRMPreviewItem struct {
+	LibraryCID   string `json:"library_cid"`
+	LibraryName  string `json:"library_name"`
+	RelativePath string `json:"relative_path"`
+	STRMPath     string `json:"strm_path"`
+	PlayPath     string `json:"play_path"`
+	Size         int64  `json:"size"`
+}
+
+type STRMPreview struct {
+	Items   []STRMPreviewItem `json:"items"`
+	Total   int               `json:"total"`
+	Limit   int               `json:"limit"`
+	Source  string            `json:"source"`
+	Message string            `json:"message,omitempty"`
+}
+
 type P115SyncRun struct {
 	ID           string     `json:"id"`
 	Trigger      string     `json:"trigger"`
@@ -330,10 +348,11 @@ type LogEntry struct {
 }
 
 type LogPage struct {
-	Items []LogEntry `json:"items"`
-	Total int        `json:"total"`
-	Limit int        `json:"limit"`
-	Type  string     `json:"type"`
+	Items  []LogEntry `json:"items"`
+	Total  int        `json:"total"`
+	Limit  int        `json:"limit"`
+	Offset int        `json:"offset"`
+	Type   string     `json:"type"`
 }
 
 type P115TreeSnapshotItem struct {
@@ -389,6 +408,23 @@ type EmbySTRMItem struct {
 	LastSeenAt   time.Time `json:"last_seen_at"`
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+type EmbyPlaybackProgress struct {
+	ID            string     `json:"id"`
+	EmbyServerID  string     `json:"emby_server_id"`
+	UserID        string     `json:"user_id"`
+	EmbyItemID    string     `json:"emby_item_id"`
+	STRMLinkID    string     `json:"strm_link_id"`
+	PositionTicks int64      `json:"position_ticks"`
+	DurationTicks int64      `json:"duration_ticks"`
+	Played        bool       `json:"played"`
+	Client        string     `json:"client"`
+	Device        string     `json:"device"`
+	PlaySessionID string     `json:"play_session_id"`
+	LastEvent     string     `json:"last_event"`
+	UpdatedAt     time.Time  `json:"updated_at"`
+	ClearedAt     *time.Time `json:"cleared_at,omitempty"`
 }
 
 type NamingTemplate struct {

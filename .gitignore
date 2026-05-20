@@ -32,8 +32,9 @@ bin/
 /releases/
 /backups/
 /scripts/
-/docker-compose.release.*.yml
-/docs/
+/compose/
+/frontend_old/
+/frontend/FRONTEND_UI_OPTIMIZATION_PLAN.md
 /初版.md
 
 # Logs and temporary files

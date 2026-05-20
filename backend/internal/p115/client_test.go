@@ -1,9 +1,11 @@
 package p115
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -86,6 +88,71 @@ func TestClientUsesCookiesBeforeOpenToken(t *testing.T) {
 	})
 	if !openOnlyClient.preferOpen() {
 		t.Fatal("expected Open API when cookies are not available")
+	}
+}
+
+func TestClientRefreshesOpenTokenAndRetriesRequest(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		switch calls {
+		case 1:
+			if got := r.Header.Get("Authorization"); got != "Bearer old-access" {
+				t.Fatalf("first request auth = %q", got)
+			}
+			_, _ = w.Write([]byte(`{"state":false,"code":40140116,"message":"token expired"}`))
+		case 2:
+			if got := r.Header.Get("Authorization"); got != "Bearer new-access" {
+				t.Fatalf("retry request auth = %q", got)
+			}
+			_, _ = w.Write([]byte(`{"state":true,"data":{"ok":true}}`))
+		default:
+			t.Fatalf("unexpected request count %d", calls)
+		}
+	}))
+	defer server.Close()
+
+	refreshCalls := 0
+	client := NewClientWithTokenRefresh(
+		models.P115Settings{AccessToken: "old-access", RefreshToken: "refresh"},
+		func(ctx context.Context, settings models.P115Settings) (models.P115Settings, error) {
+			refreshCalls++
+			if settings.AccessToken != "old-access" || settings.RefreshToken != "refresh" {
+				t.Fatalf("unexpected refresh settings %#v", settings)
+			}
+			settings.AccessToken = "new-access"
+			settings.RefreshToken = "new-refresh"
+			return settings, nil
+		},
+	)
+	payload, _, err := client.requestJSON(context.Background(), http.MethodGet, server.URL, nil, true, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !responseOK(payload) {
+		t.Fatalf("unexpected payload %#v", payload)
+	}
+	if refreshCalls != 1 {
+		t.Fatalf("refresh calls = %d, want 1", refreshCalls)
+	}
+	if calls != 2 {
+		t.Fatalf("request calls = %d, want 2", calls)
+	}
+}
+
+func TestOpenAuthCodeMatchesOpenListRefreshCodes(t *testing.T) {
+	for _, payload := range []map[string]any{
+		{"code": json.Number("99")},
+		{"code": json.Number("40140116")},
+		{"errno": "40100000"},
+	} {
+		if !openAuthCode(payload) {
+			t.Fatalf("expected auth code for %#v", payload)
+		}
+	}
+	if openAuthCode(map[string]any{"code": json.Number("0")}) {
+		t.Fatal("success code must not be treated as auth failure")
 	}
 }
 
@@ -248,47 +315,121 @@ func TestParseExportTreeDetectsDottedDirectoryByChildren(t *testing.T) {
 	for _, item := range items {
 		byPath[item.RelativePath] = item
 	}
-	dir := byPath["media/movies/梅根2.0 (2025)"]
+	dir := byPath["根目录/media/movies/梅根2.0 (2025)"]
 	if !dir.IsDirectory {
 		t.Fatalf("expected dotted folder to be detected as directory, got %#v", dir)
 	}
-	if !isMediaTreeItem(byPath["media/movies/梅根2.0 (2025)/梅根2.0 (2025).mkv"]) {
+	if !isMediaTreeItem(byPath["根目录/media/movies/梅根2.0 (2025)/梅根2.0 (2025).mkv"]) {
 		t.Fatalf("expected media file, got %#v", byPath)
 	}
 }
 
-func TestStripExportRootDirectoryRemovesSelectedCIDRoot(t *testing.T) {
-	items := []TreeItem{
-		{RelativePath: "media", Name: "media", Depth: 1, IsDirectory: true},
-		{RelativePath: "media/movies", Name: "movies", Depth: 2, IsDirectory: true},
-		{RelativePath: "media/movies/A.mkv", Name: "A.mkv", Depth: 3},
-		{RelativePath: "media/tv", Name: "tv", Depth: 2, IsDirectory: true},
+func TestParseExportTreeKeepsSelectedCIDRoot(t *testing.T) {
+	data := utf16ExportTree(t, strings.Join([]string{
+		"|--日韩电影",
+		"| |-小森林（系列）",
+		"| | |-小森林：冬春篇（2015）",
+		"| | | |-小森林：冬春篇（2015）- 1080p AVC DTS-HD MA.iso",
+	}, "\n"))
+	items, err := parseExportTree(data)
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	got := stripExportRootDirectory(items)
-
-	paths := make([]string, 0, len(got))
-	for _, item := range got {
+	paths := make([]string, 0, len(items))
+	for _, item := range items {
 		paths = append(paths, item.RelativePath)
-		if item.RelativePath == "movies/A.mkv" && item.Depth != 2 {
-			t.Fatalf("expected stripped depth 2, got %#v", item)
-		}
 	}
-	want := []string{"movies", "movies/A.mkv", "tv"}
+	want := []string{
+		"日韩电影",
+		"日韩电影/小森林（系列）",
+		"日韩电影/小森林（系列）/小森林：冬春篇（2015）",
+		"日韩电影/小森林（系列）/小森林：冬春篇（2015）/小森林：冬春篇（2015）- 1080p AVC DTS-HD MA.iso",
+	}
 	if strings.Join(paths, "|") != strings.Join(want, "|") {
-		t.Fatalf("unexpected stripped paths %#v", paths)
+		t.Fatalf("unexpected export tree paths %#v", paths)
 	}
 }
 
-func TestStripExportRootDirectoryKeepsMultipleTopLevelFolders(t *testing.T) {
+func TestNormalizeExportRootDirectoryUsesSelectedCIDName(t *testing.T) {
 	items := []TreeItem{
-		{RelativePath: "movies", Name: "movies", Depth: 1, IsDirectory: true},
-		{RelativePath: "tv", Name: "tv", Depth: 1, IsDirectory: true},
+		{RelativePath: "根目录", Name: "根目录", Depth: 1, IsDirectory: true},
+		{RelativePath: "根目录/medias", Name: "medias", Depth: 2, IsDirectory: true},
+		{RelativePath: "根目录/medias/tv/数码宝贝 (1999)/Season 02/A.mkv", Name: "A.mkv", Depth: 6},
 	}
 
-	got := stripExportRootDirectory(items)
-	if len(got) != len(items) || got[0].RelativePath != "movies" || got[1].RelativePath != "tv" {
-		t.Fatalf("expected multiple top-level folders to stay unchanged, got %#v", got)
+	got := normalizeExportRootDirectory(items, "medias")
+	paths := make([]string, 0, len(got))
+	for _, item := range got {
+		paths = append(paths, item.RelativePath)
+	}
+	want := []string{
+		"medias",
+		"medias/tv/数码宝贝 (1999)/Season 02/A.mkv",
+	}
+	if strings.Join(paths, "|") != strings.Join(want, "|") {
+		t.Fatalf("unexpected synthetic root strip paths %#v", paths)
+	}
+	if got[0].Depth != 1 || got[1].Depth != 5 {
+		t.Fatalf("unexpected stripped depths %#v", got)
+	}
+}
+
+func TestNormalizeExportRootDirectoryKeepsSelectedCIDRoot(t *testing.T) {
+	items := []TreeItem{
+		{RelativePath: "medias", Name: "medias", Depth: 1, IsDirectory: true},
+		{RelativePath: "medias/tv/A.mkv", Name: "A.mkv", Depth: 3},
+	}
+
+	got := normalizeExportRootDirectory(items, "medias")
+	if len(got) != len(items) || got[0].RelativePath != "medias" || got[1].RelativePath != "medias/tv/A.mkv" {
+		t.Fatalf("selected cid root should stay unchanged, got %#v", got)
+	}
+}
+
+func TestNormalizeExportRootDirectoryPrefixesCIDNameWhenTreeStartsWithChildren(t *testing.T) {
+	items := []TreeItem{
+		{RelativePath: "tv", Name: "tv", Depth: 1, IsDirectory: true},
+		{RelativePath: "tv/数码宝贝 (1999)/Season 02/A.mkv", Name: "A.mkv", Depth: 4},
+		{RelativePath: "movie/B.iso", Name: "B.iso", Depth: 2},
+	}
+
+	got := normalizeExportRootDirectory(items, "media")
+	paths := make([]string, 0, len(got))
+	for _, item := range got {
+		paths = append(paths, item.RelativePath)
+	}
+	want := []string{
+		"media/tv",
+		"media/tv/数码宝贝 (1999)/Season 02/A.mkv",
+		"media/movie/B.iso",
+	}
+	if strings.Join(paths, "|") != strings.Join(want, "|") {
+		t.Fatalf("expected selected cid name to be prefixed, got %#v", paths)
+	}
+	if got[0].Depth != 2 || got[1].Depth != 5 || got[2].Depth != 3 {
+		t.Fatalf("unexpected prefixed depths %#v", got)
+	}
+}
+
+func TestDirectoryNameFromPayloadUsesCIDPath(t *testing.T) {
+	payload := decodeMap(t, `{
+		"path":[
+			{"cid":"0","name":"根目录"},
+			{"cid":"3429318291990438503","name":"medias"}
+		],
+		"data":[{"fid":"child","fn":"tv","fc":0}]
+	}`)
+
+	if got := directoryNameFromPayload(payload, "3429318291990438503"); got != "medias" {
+		t.Fatalf("unexpected directory name %q", got)
+	}
+}
+
+func TestUserNameFromPayloadReadsNestedCookieProfile(t *testing.T) {
+	payload := decodeMap(t, `{"state":true,"data":{"user_name":"Curio User","uid":"11501"}}`)
+
+	if got := userNameFromPayload(payload); got != "Curio User" {
+		t.Fatalf("unexpected user name %q", got)
 	}
 }
 

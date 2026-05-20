@@ -1,7 +1,9 @@
 package embyproxy
 
 import (
+	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -143,6 +145,228 @@ func TestItemDetailIDOnlyMatchesConcreteItemDetails(t *testing.T) {
 	}
 }
 
+func TestResumeRouteUsesPlainItemMediaSourceRewrite(t *testing.T) {
+	req, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:8096/Users/u/Items/Resume?Recursive=true&MediaTypes=Video", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Request:    req,
+	}
+	if !shouldRewriteItemMediaSources("/Users/u/Items/Resume", resp) {
+		t.Fatal("expected resume route to keep media-source rewriting")
+	}
+	if !shouldRewriteResumeItems("/Users/u/Items/Resume", resp) {
+		t.Fatal("expected resume route to use resume sanitizer")
+	}
+	if !shouldNoStorePlaybackResponse("/Users/u/Items/Resume", resp) {
+		t.Fatal("expected resume route to be marked no-store")
+	}
+}
+
+func TestShowEpisodeRoutesUseItemMediaSourceRewrite(t *testing.T) {
+	for _, raw := range []string{
+		"/Shows/58526/Episodes",
+		"/Shows/NextUp",
+	} {
+		req, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:8096"+raw+"?UserId=u&Fields=MediaSources", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp := &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Request:    req,
+		}
+		if !shouldRewriteItemMediaSources(raw, resp) {
+			t.Fatalf("expected %s to rewrite media sources", raw)
+		}
+	}
+}
+
+func TestSanitizeHillsResumeLikeItemsRemovesZeroDatePlayedItems(t *testing.T) {
+	req, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:8096/Users/u/Items?SortBy=DatePlayed&Limit=20", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Emby-Client", "Hills")
+	payload := map[string]any{
+		"Items": []any{
+			map[string]any{"Id": "zero", "Type": "Episode", "UserData": map[string]any{"PlaybackPositionTicks": 0, "Played": false}},
+			map[string]any{"Id": "resume", "Type": "Episode", "UserData": map[string]any{"PlaybackPositionTicks": 120 * embyTickPerSecond, "Played": false}},
+		},
+		"TotalRecordCount": float64(2),
+	}
+	changed, removed := sanitizeHillsResumeLikeItems(req, payload)
+	if !changed || removed != 1 {
+		t.Fatalf("expected one invalid Hills item to be removed, changed=%t removed=%d", changed, removed)
+	}
+	items := payload["Items"].([]any)
+	if len(items) != 1 || items[0].(map[string]any)["Id"] != "resume" {
+		t.Fatalf("unexpected items %#v", items)
+	}
+	if got, _ := int64FromAny(payload["TotalRecordCount"]); got != 1 {
+		t.Fatalf("unexpected total %d", got)
+	}
+}
+
+func TestSanitizeHillsResumeLikeItemsIgnoresNormalEpisodeLists(t *testing.T) {
+	req, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:8096/Shows/58526/Episodes?UserId=u", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Emby-Client", "Hills")
+	payload := map[string]any{
+		"Items": []any{
+			map[string]any{"Id": "episode", "Type": "Episode", "UserData": map[string]any{"PlaybackPositionTicks": 0, "Played": false}},
+		},
+		"TotalRecordCount": float64(1),
+	}
+	changed, removed := sanitizeHillsResumeLikeItems(req, payload)
+	if changed || removed != 0 {
+		t.Fatalf("normal episode lists must not be sanitized, changed=%t removed=%d", changed, removed)
+	}
+}
+
+func TestRewriteItemMediaSourcesNoMatchSetsNoStore(t *testing.T) {
+	req, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:8096/Users/u/Items?Recursive=true&SortBy=DatePlayed", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}, "Vary": []string{"Accept-Encoding"}},
+		Body:       io.NopCloser(strings.NewReader(`{"Items":[{"Id":"1","UserData":{"PlaybackPositionTicks":0,"Played":false}}],"TotalRecordCount":1}`)),
+		Request:    req,
+	}
+	if err := (*Proxy)(nil).rewriteItemMediaSources(resp, "/Users/u/Items"); err != nil {
+		t.Fatal(err)
+	}
+	if got := resp.Header.Get("Cache-Control"); !strings.Contains(got, "no-store") || !strings.Contains(got, "private") {
+		t.Fatalf("expected private no-store cache control, got %q", got)
+	}
+	vary := resp.Header.Get("Vary")
+	for _, want := range []string{"Accept-Encoding", "X-Emby-Client", "User-Agent"} {
+		if !strings.Contains(vary, want) {
+			t.Fatalf("expected Vary to contain %q, got %q", want, vary)
+		}
+	}
+}
+
+func TestFilterInvalidResumeItemsRemovesZeroProgress(t *testing.T) {
+	payload := map[string]any{
+		"Items": []any{
+			map[string]any{"Id": "zero", "UserData": map[string]any{"PlaybackPositionTicks": float64(0), "Played": false}},
+			map[string]any{"Id": "played", "UserData": map[string]any{"PlaybackPositionTicks": float64(300 * embyTickPerSecond), "Played": true}},
+			map[string]any{"Id": "resume", "UserData": map[string]any{"PlaybackPositionTicks": float64(300 * embyTickPerSecond), "Played": false}},
+		},
+		"TotalRecordCount": float64(3),
+	}
+	changed, removed := filterInvalidResumeItems(payload)
+	if !changed || removed != 2 {
+		t.Fatalf("expected two invalid resume items to be removed, changed=%t removed=%d", changed, removed)
+	}
+	items := payload["Items"].([]any)
+	if len(items) != 1 || items[0].(map[string]any)["Id"] != "resume" {
+		t.Fatalf("unexpected resume items %#v", items)
+	}
+	if got, _ := int64FromAny(payload["TotalRecordCount"]); got != 1 {
+		t.Fatalf("unexpected total %d", got)
+	}
+}
+
+func TestMergePlaybackProgressIntoResumePayloadAddsMissingAndSorts(t *testing.T) {
+	now := time.Date(2026, 5, 19, 12, 0, 0, 0, time.UTC)
+	payload := map[string]any{
+		"Items": []any{
+			map[string]any{"Id": "old", "UserData": map[string]any{"PlaybackPositionTicks": float64(50 * embyTickPerSecond), "Played": false}},
+		},
+		"TotalRecordCount": float64(1),
+	}
+	progresses := []models.EmbyPlaybackProgress{
+		{EmbyItemID: "missing", PositionTicks: 300 * embyTickPerSecond, DurationTicks: 1000 * embyTickPerSecond, UpdatedAt: now.Add(time.Minute)},
+		{EmbyItemID: "old", PositionTicks: 120 * embyTickPerSecond, DurationTicks: 900 * embyTickPerSecond, UpdatedAt: now},
+	}
+	details := map[string]map[string]any{
+		"missing": {"Id": "missing", "UserData": map[string]any{"Played": true}, "MediaSources": []any{map[string]any{}}},
+	}
+	changed, added, updated := mergePlaybackProgressIntoResumePayload(payload, progresses, details, 0)
+	if !changed || added != 1 || updated != 1 {
+		t.Fatalf("unexpected merge result changed=%t added=%d updated=%d", changed, added, updated)
+	}
+	items := payload["Items"].([]any)
+	if len(items) != 2 {
+		t.Fatalf("expected two resume items, got %#v", items)
+	}
+	first := items[0].(map[string]any)
+	if first["Id"] != "missing" {
+		t.Fatalf("expected newest ledger item first, got %#v", items)
+	}
+	firstUserData := first["UserData"].(map[string]any)
+	if got, _ := int64FromAny(firstUserData["PlaybackPositionTicks"]); got != 300*embyTickPerSecond {
+		t.Fatalf("unexpected missing progress %d", got)
+	}
+	if played, _ := boolFromAny(firstUserData["Played"]); played {
+		t.Fatal("missing item should be forced to unplayed")
+	}
+	if got, _ := int64FromAny(first["RunTimeTicks"]); got != 1000*embyTickPerSecond {
+		t.Fatalf("unexpected runtime %d", got)
+	}
+	second := items[1].(map[string]any)
+	secondUserData := second["UserData"].(map[string]any)
+	if got, _ := int64FromAny(secondUserData["PlaybackPositionTicks"]); got != 120*embyTickPerSecond {
+		t.Fatalf("expected existing item progress to be refreshed, got %d", got)
+	}
+	if got, _ := int64FromAny(payload["TotalRecordCount"]); got != 2 {
+		t.Fatalf("unexpected total %d", got)
+	}
+}
+
+func TestMergePlaybackProgressIntoResumePayloadRespectsLimitAndCleared(t *testing.T) {
+	clearedAt := time.Date(2026, 5, 19, 12, 0, 0, 0, time.UTC)
+	payload := map[string]any{"Items": []any{}}
+	progresses := []models.EmbyPlaybackProgress{
+		{EmbyItemID: "a", PositionTicks: 200 * embyTickPerSecond, UpdatedAt: clearedAt.Add(2 * time.Minute)},
+		{EmbyItemID: "b", PositionTicks: 190 * embyTickPerSecond, UpdatedAt: clearedAt.Add(time.Minute)},
+		{EmbyItemID: "cleared", PositionTicks: 180 * embyTickPerSecond, UpdatedAt: clearedAt, ClearedAt: &clearedAt},
+	}
+	details := map[string]map[string]any{
+		"a":       {"Id": "a"},
+		"b":       {"Id": "b"},
+		"cleared": {"Id": "cleared"},
+	}
+	changed, added, _ := mergePlaybackProgressIntoResumePayload(payload, progresses, details, 1)
+	if !changed || added != 2 {
+		t.Fatalf("unexpected merge result changed=%t added=%d", changed, added)
+	}
+	items := payload["Items"].([]any)
+	if len(items) != 1 || items[0].(map[string]any)["Id"] != "a" {
+		t.Fatalf("expected newest active item only, got %#v", items)
+	}
+	if got, _ := int64FromAny(payload["TotalRecordCount"]); got != 1 {
+		t.Fatalf("unexpected total %d", got)
+	}
+}
+
+func TestResumeRequestAllowsVideoRespectsMediaTypes(t *testing.T) {
+	audioReq, err := http.NewRequest(http.MethodGet, "http://127.0.0.1/Users/u/Items/Resume?MediaTypes=Audio", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resumeRequestAllowsVideo(audioReq) {
+		t.Fatal("audio-only resume requests should not receive video ledger items")
+	}
+	videoReq, err := http.NewRequest(http.MethodGet, "http://127.0.0.1/Users/u/Items/Resume?MediaTypes=Audio,Video", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resumeRequestAllowsVideo(videoReq) {
+		t.Fatal("video resume requests should receive video ledger items")
+	}
+}
+
 func TestApplyDirectPlayMediaSourceUsesNativeStreamURL(t *testing.T) {
 	req, err := http.NewRequest(http.MethodGet, "http://192.168.10.83:8097/Items/123/PlaybackInfo", nil)
 	if err != nil {
@@ -214,6 +438,9 @@ func TestApplyDirectPlayMediaSourceCanRewritePathToProxyURL(t *testing.T) {
 	if got := source["Size"]; got != int64(987654321) {
 		t.Fatalf("unexpected Size %#v", got)
 	}
+	if got := source["SupportsProbing"]; got != false {
+		t.Fatalf("unexpected SupportsProbing %#v", got)
+	}
 }
 
 func TestMediaContainerForLinkIgnoresSTRMPathExtension(t *testing.T) {
@@ -274,6 +501,39 @@ func TestMarkPrewarmScheduledDedupesRecentRequests(t *testing.T) {
 	}
 }
 
+func TestMediaStreamsForLinkKeepsKnownDurationWithoutSyncProbe(t *testing.T) {
+	proxy := New(nil, nil)
+	req, err := http.NewRequest(http.MethodGet, "http://192.168.10.83:8097/Items/123", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	streams, duration := proxy.mediaStreamsForLink(context.Background(), req, models.STRMLink{
+		ID:                 "link-1",
+		RelativePath:       "shows/E01.mkv",
+		MediaDurationTicks: 12345,
+	}, true, "UA")
+	if len(streams) != 0 {
+		t.Fatalf("expected no uncached streams, got %#v", streams)
+	}
+	if duration != 12345 {
+		t.Fatalf("expected cached duration, got %d", duration)
+	}
+}
+
+func TestMarkMediaProbeScheduledDedupesRecentRequests(t *testing.T) {
+	proxy := New(nil, nil)
+	if !proxy.markMediaProbeScheduled("link-1\x00UA") {
+		t.Fatal("expected first media probe to be scheduled")
+	}
+	if proxy.markMediaProbeScheduled("link-1\x00UA") {
+		t.Fatal("expected duplicate media probe to be skipped")
+	}
+	proxy.mediaProbeRecent["link-1\x00UA"] = time.Now().Add(-mediaProbeDedupeWindow - time.Second)
+	if !proxy.markMediaProbeScheduled("link-1\x00UA") {
+		t.Fatal("expected expired media probe key to be scheduled again")
+	}
+}
+
 func TestDownloadItemIDSupportsDownloadRoutes(t *testing.T) {
 	for raw, want := range map[string]string{
 		"/Items/123/Download":  "123",
@@ -312,6 +572,32 @@ func TestPlaybackCheckinRouteSupportsSessionAndLegacyRoutes(t *testing.T) {
 		}
 		if got.Kind != tc.kind || got.UserID != tc.userID || got.ItemID != tc.itemID {
 			t.Fatalf("playbackCheckinRoute(%q) = %#v", tc.raw, got)
+		}
+	}
+}
+
+func TestManualPlaybackUpdateRouteDetectsResumeClears(t *testing.T) {
+	cases := []struct {
+		method string
+		raw    string
+		body   string
+		want   bool
+	}{
+		{http.MethodDelete, "/Users/user-1/PlayedItems/21642", "", true},
+		{http.MethodPost, "/Users/user-1/PlayedItems/21642/Delete", "", true},
+		{http.MethodPost, "/Users/user-1/PlayedItems/21642", "", false},
+		{http.MethodPost, "/Users/user-1/Items/21642/UserData", `{"Played":false}`, true},
+		{http.MethodPost, "/Users/user-1/Items/21642/UserData", `{"PlaybackPositionTicks":0,"Played":false}`, true},
+		{http.MethodPost, "/Users/user-1/Items/21642/UserData", `{"PlaybackPositionTicks":1200000000,"Played":false}`, false},
+	}
+	for _, tc := range cases {
+		route, ok := manualPlaybackUpdateRoute(tc.method, tc.raw)
+		if tc.want && !ok {
+			t.Fatalf("manualPlaybackUpdateRoute(%q, %q) did not match", tc.method, tc.raw)
+		}
+		got := ok && manualPlaybackUpdateClearsResume(route, tc.method, []byte(tc.body))
+		if got != tc.want {
+			t.Fatalf("manual clear %s %s = %t, want %t", tc.method, tc.raw, got, tc.want)
 		}
 	}
 }
@@ -404,6 +690,168 @@ func TestPlaybackCorrectionDecisions(t *testing.T) {
 	}
 }
 
+func TestPlaybackProgressSaveDecisionUsesCurrentPosition(t *testing.T) {
+	state := playbackSessionState{
+		RunTimeTicks:      1000 * embyTickPerSecond,
+		LastPositionTicks: 120 * embyTickPerSecond,
+		MaxPositionTicks:  600 * embyTickPerSecond,
+	}
+	got := playbackProgressSaveDecision(playbackCheckin{
+		Kind:             playbackCheckinProgress,
+		PositionTicks:    120 * embyTickPerSecond,
+		HasPositionTicks: true,
+	}, state)
+	if got.Action != playbackCorrectionSaveResume {
+		t.Fatalf("expected progress to save resume, got %#v", got)
+	}
+	if got.PositionTicks != 120*embyTickPerSecond {
+		t.Fatalf("expected current position, got %d", got.PositionTicks)
+	}
+}
+
+func TestFreshStartPlaybackDetectsAndSuppressesStaleResume(t *testing.T) {
+	state := playbackSessionState{
+		InitialPositionTicks: 350 * embyTickPerSecond,
+		HasInitialPosition:   true,
+		RunTimeTicks:         1000 * embyTickPerSecond,
+	}
+	if !playbackStartedFromBeginning(playbackCheckin{
+		Kind:             playbackCheckinPlaying,
+		PositionTicks:    0,
+		HasPositionTicks: true,
+	}, state) {
+		t.Fatal("expected zero-position playing checkin with existing resume to be treated as fresh start")
+	}
+	state.FreshStartCleared = true
+	state.FreshStartResumeTicks = 350 * embyTickPerSecond
+	got := playbackProgressSaveDecision(playbackCheckin{
+		Kind:             playbackCheckinProgress,
+		PositionTicks:    351 * embyTickPerSecond,
+		HasPositionTicks: true,
+	}, state)
+	if got.Action != playbackCorrectionNone || !strings.Contains(got.Reason, "fresh start") {
+		t.Fatalf("expected stale resume progress to be suppressed, got %#v", got)
+	}
+	got = playbackProgressSaveDecision(playbackCheckin{
+		Kind:             playbackCheckinProgress,
+		PositionTicks:    20 * embyTickPerSecond,
+		HasPositionTicks: true,
+	}, state)
+	if got.Action != playbackCorrectionSaveResume {
+		t.Fatalf("expected real fresh-start progress to save, got %#v", got)
+	}
+}
+
+func TestPlaybackCorrectionUsesCurrentStopPosition(t *testing.T) {
+	state := playbackSessionState{
+		RunTimeTicks:      1000 * embyTickPerSecond,
+		LastPositionTicks: 120 * embyTickPerSecond,
+		MaxPositionTicks:  600 * embyTickPerSecond,
+	}
+	got := playbackCorrection(playbackCheckin{
+		Kind:             playbackCheckinStopped,
+		PositionTicks:    30 * embyTickPerSecond,
+		HasPositionTicks: true,
+	}, state)
+	if got.Action != playbackCorrectionClearWatched {
+		t.Fatalf("expected short current stop to clear watched, got %#v", got)
+	}
+	if got.PositionTicks != 30*embyTickPerSecond {
+		t.Fatalf("expected current stop position, got %d", got.PositionTicks)
+	}
+}
+
+func TestPlaybackCorrectionClearsFreshStartStaleStop(t *testing.T) {
+	state := playbackSessionState{
+		RunTimeTicks:          1000 * embyTickPerSecond,
+		FreshStartCleared:     true,
+		FreshStartResumeTicks: 350 * embyTickPerSecond,
+	}
+	got := playbackCorrection(playbackCheckin{
+		Kind:             playbackCheckinStopped,
+		PositionTicks:    350 * embyTickPerSecond,
+		HasPositionTicks: true,
+	}, state)
+	if got.Action != playbackCorrectionClearWatched || !strings.Contains(got.Reason, "fresh start") {
+		t.Fatalf("expected stale fresh-start stop to clear resume, got %#v", got)
+	}
+}
+
+func TestManualPlaybackClearSuppressesOlderSessionSave(t *testing.T) {
+	proxy := New(nil, nil)
+	startedAt := time.Date(2026, 5, 19, 12, 0, 0, 0, time.UTC)
+	proxy.rememberManualPlaybackClear("user-1", "item-1", startedAt.Add(time.Minute))
+	if !proxy.playbackManuallyCleared([]string{"user-1"}, "item-1", playbackSessionState{StartedAt: startedAt}, startedAt.Add(2*time.Minute)) {
+		t.Fatal("expected older playback session to be suppressed")
+	}
+	if proxy.playbackManuallyCleared([]string{"user-1"}, "item-1", playbackSessionState{StartedAt: startedAt.Add(2 * time.Minute)}, startedAt.Add(3*time.Minute)) {
+		t.Fatal("expected newer playback session to be allowed")
+	}
+}
+
+func TestPlaybackProgressSaveDecisionSkipsNearWatchedThreshold(t *testing.T) {
+	got := playbackProgressSaveDecision(playbackCheckin{
+		Kind:             playbackCheckinProgress,
+		PositionTicks:    920 * embyTickPerSecond,
+		HasPositionTicks: true,
+	}, playbackSessionState{RunTimeTicks: 1000 * embyTickPerSecond})
+	if got.Action != playbackCorrectionNone || !strings.Contains(got.Reason, "watched") {
+		t.Fatalf("expected near-end progress to be skipped, got %#v", got)
+	}
+}
+
+func TestMergePlaybackStatePreservesInitialPlayed(t *testing.T) {
+	existing := playbackSessionState{
+		UserID:           "user-1",
+		ItemID:           "item-1",
+		StartedAt:        time.Date(2026, 5, 19, 12, 0, 0, 0, time.UTC),
+		InitialPlayed:    true,
+		HasInitialPlayed: true,
+	}
+	next := playbackSessionState{
+		UserID:    "user-1",
+		ItemID:    "item-1",
+		StartedAt: time.Date(2026, 5, 19, 12, 0, 10, 0, time.UTC),
+	}
+	got := mergePlaybackState(existing, next)
+	if !got.HasInitialPlayed || !got.InitialPlayed {
+		t.Fatalf("expected initial played state to be preserved, got %#v", got)
+	}
+	if !got.StartedAt.Equal(existing.StartedAt) {
+		t.Fatalf("expected earliest start time, got %s", got.StartedAt)
+	}
+}
+
+func TestMarkPlaybackProgressSavedThrottlesDuplicates(t *testing.T) {
+	proxy := New(nil, nil)
+	now := time.Date(2026, 5, 19, 12, 0, 0, 0, time.UTC)
+	if !proxy.markPlaybackProgressSaved("user-1", "item-1", 120*embyTickPerSecond, now) {
+		t.Fatal("expected first progress save to be allowed")
+	}
+	if proxy.markPlaybackProgressSaved("user-1", "item-1", 125*embyTickPerSecond, now.Add(5*time.Second)) {
+		t.Fatal("expected small duplicate progress to be throttled")
+	}
+	if !proxy.markPlaybackProgressSaved("user-1", "item-1", 180*embyTickPerSecond, now.Add(6*time.Second)) {
+		t.Fatal("expected seek jump to be saved")
+	}
+	if !proxy.markPlaybackProgressSaved("user-1", "item-1", 185*embyTickPerSecond, now.Add(progressSaveInterval+7*time.Second)) {
+		t.Fatal("expected progress after interval to be saved")
+	}
+}
+
+func TestEmbyAPIURLPreservesQuery(t *testing.T) {
+	got, err := embyAPIURL(models.P115Settings{EmbyUpstreamURL: "http://emby:8096/base"}, "/Users/u/Items?SeriesId=s&Limit=20")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Path != "/base/Users/u/Items" {
+		t.Fatalf("unexpected path %q", got.Path)
+	}
+	if got.Query().Get("SeriesId") != "s" || got.Query().Get("Limit") != "20" {
+		t.Fatalf("unexpected query %q", got.RawQuery)
+	}
+}
+
 func TestPlaybackSessionStateMergesAliases(t *testing.T) {
 	proxy := New(nil, nil)
 	first := playbackCheckin{
@@ -421,5 +869,52 @@ func TestPlaybackSessionStateMergesAliases(t *testing.T) {
 	merged := proxy.mergePlaybackCheckinState(playbackCheckin{Kind: playbackCheckinStopped, PlaySessionID: "session-1"})
 	if merged.UserID != "user-1" || merged.ItemID != "21642" || merged.RunTimeTicks != 1000*embyTickPerSecond {
 		t.Fatalf("unexpected merged checkin %#v", merged)
+	}
+}
+
+func TestPlaybackRequestContextPrefersRealEmbyUser(t *testing.T) {
+	proxy := New(nil, nil)
+	req, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:8097/Users/d045e0c1b36c4130bf193d19ad79ea14/Items/58619", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy.rememberPlaybackRequestContext(req, "58619", models.STRMLink{ID: "link-1", MediaDurationTicks: 1000 * embyTickPerSecond})
+	merged := proxy.mergePlaybackCheckinState(playbackCheckin{
+		Kind:          playbackCheckinStopped,
+		UserID:        "92f4b4ca-8faa-427a-b803-54afae565ab8",
+		ItemID:        "58619",
+		PlaySessionID: "session-1",
+	})
+	if merged.UserID != "d045e0c1b36c4130bf193d19ad79ea14" {
+		t.Fatalf("expected trusted request user, got %#v", merged)
+	}
+	candidates := playbackCorrectionUserIDs(merged, proxy.playbackSessions["item:58619"])
+	if len(candidates) == 0 || candidates[0] != "d045e0c1b36c4130bf193d19ad79ea14" {
+		t.Fatalf("unexpected correction candidates %#v", candidates)
+	}
+}
+
+func TestPlaybackRequestUserIDReadsQueryPathAndAuthorization(t *testing.T) {
+	req, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:8097/Items/123?UserId=query-user", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := playbackRequestUserID(req); got != "query-user" {
+		t.Fatalf("unexpected query user %q", got)
+	}
+	req, err = http.NewRequest(http.MethodGet, "http://127.0.0.1:8097/Users/path-user/Items/123", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := playbackRequestUserID(req); got != "path-user" {
+		t.Fatalf("unexpected path user %q", got)
+	}
+	req, err = http.NewRequest(http.MethodGet, "http://127.0.0.1:8097/Items/123", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Emby-Authorization", `MediaBrowser Client="Yamby", UserId="auth-user", Token="token"`)
+	if got := playbackRequestUserID(req); got != "auth-user" {
+		t.Fatalf("unexpected auth user %q", got)
 	}
 }

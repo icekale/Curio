@@ -23,6 +23,7 @@ import (
 	"curio/internal/embyproxy"
 	"curio/internal/models"
 	"curio/internal/naming"
+	"curio/internal/netproxy"
 	"curio/internal/p115"
 	"curio/internal/playdiag"
 	"curio/internal/repository"
@@ -118,11 +119,13 @@ func NewWithServices(store *repository.Store, workerService *worker.Service, scr
 	router.Post("/api/p115/test", api.testP115)
 	router.Post("/api/p115/export-tree", api.exportP115Tree)
 	router.Post("/api/p115/nodes/rebuild", api.rebuildP115Nodes)
+	router.Post("/api/p115/strm/preview", api.previewP115STRM)
 	router.Post("/api/p115/strm/sync", api.syncP115STRM)
 	router.Post("/api/p115/strm/cleanup", api.cleanupP115STRM)
 	router.Get("/api/p115/sync-runs", api.p115SyncRuns)
 	router.Get("/api/p115/playback/logs", api.p115PlaybackLogs)
 	router.Get("/api/logs", api.logs)
+	router.Get("/api/logs/{logID}", api.logDetail)
 	router.Get("/api/settings/classification", api.classification)
 	router.Put("/api/settings/classification", api.saveClassification)
 	router.Get("/api/settings/templates", api.templates)
@@ -410,13 +413,8 @@ func (a *API) saveSystemSettings(w http.ResponseWriter, r *http.Request) {
 	mergeHiddenSystemSettings(&settings, current)
 	settings.ClassificationYAML = current.ClassificationYAML
 	if settings.NetworkProxy != "" {
-		parsed, err := url.Parse(settings.NetworkProxy)
-		if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-			writeError(w, http.StatusBadRequest, "网络代理地址无效")
-			return
-		}
-		if parsed.Scheme != "http" && parsed.Scheme != "https" {
-			writeError(w, http.StatusBadRequest, "网络代理协议必须是 http 或 https")
+		if _, err := netproxy.Parse(settings.NetworkProxy); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 	}
@@ -649,6 +647,31 @@ func (a *API) syncP115STRM(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
+func (a *API) previewP115STRM(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := contextWithTimeout(r)
+	defer cancel()
+	var settings models.P115Settings
+	if err := decodeJSON(w, r, &settings); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if existing, err := a.store.P115Settings(ctx); err == nil {
+		mergeHiddenP115Settings(&settings, existing)
+	}
+	normalized, err := validateP115Settings(settings)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	preview, err := a.p115.PreviewSTRM(ctx, normalized, requestBaseURL(r), limit)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, preview)
+}
+
 func (a *API) rebuildP115Nodes(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Minute)
 	defer cancel()
@@ -684,57 +707,113 @@ func (a *API) p115SyncRuns(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) p115PlaybackLogs(w http.ResponseWriter, r *http.Request) {
-	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	writeJSON(w, http.StatusOK, map[string]any{"items": playdiag.Records(limit)})
+	limit, offset := paginationFromRequest(r)
+	writeJSON(w, http.StatusOK, playbackLogPage("playback", limit, offset))
 }
 
 func (a *API) logs(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := contextWithTimeout(r)
 	defer cancel()
-	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	if limit <= 0 {
-		limit = 500
-	}
-	if limit > 500 {
-		limit = 500
-	}
+	limit, offset := paginationFromRequest(r)
 	logType := strings.TrimSpace(r.URL.Query().Get("type"))
 	if logType == "" {
 		logType = "all"
 	}
-	page, err := a.store.LogEntries(ctx, logType, limit)
+	if logType == "playback" {
+		writeJSON(w, http.StatusOK, playbackLogPage(logType, limit, offset))
+		return
+	}
+	dbLimit, dbOffset := limit, offset
+	playbackPage := models.LogPage{}
+	if logType == "all" {
+		playbackPage = playbackLogPage("playback", len(playdiag.Records(0)), 0)
+		dbOffset = offset - playbackPage.Total
+		if dbOffset < 0 {
+			dbOffset = 0
+		}
+		dbLimit = limit + playbackPage.Total
+	}
+	page, err := a.store.LogEntries(ctx, logType, dbLimit, dbOffset)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if logType == "all" || logType == "playback" {
-		for index, record := range playdiag.Records(limit) {
-			status := "ok"
-			lower := strings.ToLower(record.Message)
-			if strings.Contains(lower, "failed") || strings.Contains(lower, "err=") || strings.Contains(lower, "error") {
-				status = "failed"
-			}
-			page.Items = append(page.Items, models.LogEntry{
-				ID:        fmt.Sprintf("playback-%d-%d", record.Time.UnixNano(), index),
-				Type:      "playback",
-				Source:    "播放诊断",
-				Status:    status,
-				Message:   record.Message,
-				Detail:    record.Message,
-				CreatedAt: record.Time,
-			})
-		}
-		sort.SliceStable(page.Items, func(i, j int) bool {
-			return page.Items[i].CreatedAt.After(page.Items[j].CreatedAt)
+	if logType == "all" {
+		merged := append([]models.LogEntry{}, page.Items...)
+		merged = append(merged, playbackPage.Items...)
+		sort.SliceStable(merged, func(i, j int) bool {
+			return merged[i].CreatedAt.After(merged[j].CreatedAt)
 		})
-		page.Total = len(page.Items)
-		if len(page.Items) > limit {
-			page.Items = page.Items[:limit]
+		total := page.Total + playbackPage.Total
+		start := offset - dbOffset
+		if start < 0 {
+			start = 0
 		}
+		if start > len(merged) {
+			merged = nil
+		} else {
+			end := start + limit
+			if end > len(merged) {
+				end = len(merged)
+			}
+			merged = merged[start:end]
+		}
+		page = models.LogPage{Items: merged, Total: total, Limit: limit, Offset: offset, Type: logType}
+	} else {
+		page.Limit = limit
+		page.Offset = offset
 	}
-	page.Limit = limit
-	page.Type = logType
 	writeJSON(w, http.StatusOK, page)
+}
+
+func (a *API) logDetail(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := contextWithTimeout(r)
+	defer cancel()
+	entry, err := a.store.LogEntry(ctx, chi.URLParam(r, "logID"))
+	if err != nil {
+		writeError(w, http.StatusNotFound, "日志不存在")
+		return
+	}
+	writeJSON(w, http.StatusOK, entry)
+}
+
+func playbackLogPage(logType string, limit, offset int) models.LogPage {
+	records := playdiag.Records(0)
+	items := make([]models.LogEntry, 0, len(records))
+	for index, record := range records {
+		status := "ok"
+		lower := strings.ToLower(record.Message)
+		if strings.Contains(lower, "failed") || strings.Contains(lower, "err=") || strings.Contains(lower, "error") {
+			status = "failed"
+		}
+		items = append(items, models.LogEntry{
+			ID:        fmt.Sprintf("playback-%d-%d", record.Time.UnixNano(), index),
+			Type:      "playback",
+			Source:    "播放诊断",
+			Status:    status,
+			Message:   record.Message,
+			Detail:    record.Message,
+			CreatedAt: record.Time,
+		})
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		return items[i].CreatedAt.After(items[j].CreatedAt)
+	})
+	total := len(items)
+	if limit <= 0 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > total {
+		offset = total
+	}
+	end := offset + limit
+	if end > total {
+		end = total
+	}
+	return models.LogPage{Items: items[offset:end], Total: total, Limit: limit, Offset: offset, Type: logType}
 }
 
 func (a *API) play115(w http.ResponseWriter, r *http.Request) {
@@ -1296,6 +1375,9 @@ func mergeHiddenP115Settings(next *models.P115Settings, existing models.P115Sett
 	if next.RefreshToken == "" {
 		next.RefreshToken = existing.RefreshToken
 	}
+	if next.OpenTokenRefreshedAt == nil {
+		next.OpenTokenRefreshedAt = existing.OpenTokenRefreshedAt
+	}
 	if next.DirectURLTTLSeconds == 0 {
 		next.DirectURLTTLSeconds = existing.DirectURLTTLSeconds
 	}
@@ -1337,7 +1419,7 @@ func validateP115Settings(settings models.P115Settings) (models.P115Settings, er
 	if settings.AuthMode != "cookies" && settings.AuthMode != "open" {
 		return models.P115Settings{}, errors.New("115 授权方式必须是 cookies 或 open")
 	}
-	settings.STRMOutputPath = strings.TrimSpace(settings.STRMOutputPath)
+	settings.STRMOutputPath = p115.NormalizeSTRMOutputPaths(settings.STRMOutputPath)
 	if settings.STRMOutputPath == "" {
 		settings.STRMOutputPath = "/data/Curio/strm"
 	}
@@ -1357,9 +1439,16 @@ func validateP115Settings(settings models.P115Settings) (models.P115Settings, er
 	settings.FixedUserAgent = ""
 	settings.LibraryCID = strings.TrimSpace(settings.LibraryCID)
 	if settings.LibraryCID != "" {
-		if _, err := p115.ParseLibraryCID(settings.LibraryCID); err != nil {
+		libs, err := p115.ParseLibraryCIDs(settings.LibraryCID)
+		if err != nil {
 			return models.P115Settings{}, err
 		}
+		libs, err = p115.ApplyLibraryOutputRoots(libs, settings.STRMOutputPath)
+		if err != nil {
+			return models.P115Settings{}, err
+		}
+		settings.LibraryCID = p115.FormatLibraryCIDs(libs)
+		settings.STRMOutputPath = p115.FormatLibraryOutputRoots(libs)
 	}
 	if settings.KeepDeletedDays <= 0 {
 		settings.KeepDeletedDays = 7

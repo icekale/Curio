@@ -18,6 +18,7 @@ import (
 
 	"curio/internal/matcher"
 	"curio/internal/models"
+	"curio/internal/netproxy"
 	"curio/internal/parser"
 
 	"github.com/redis/go-redis/v9"
@@ -809,19 +810,7 @@ func directHTTPClient() *http.Client {
 }
 
 func httpClient(proxy string) (*http.Client, error) {
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	proxy = strings.TrimSpace(proxy)
-	if proxy != "" {
-		proxyURL, err := url.Parse(proxy)
-		if err != nil || proxyURL.Scheme == "" || proxyURL.Host == "" {
-			return nil, fmt.Errorf("网络代理地址无效")
-		}
-		if proxyURL.Scheme != "http" && proxyURL.Scheme != "https" {
-			return nil, fmt.Errorf("网络代理协议必须是 http 或 https")
-		}
-		transport.Proxy = http.ProxyURL(proxyURL)
-	}
-	return &http.Client{Timeout: tmdbHTTPTimeout, Transport: transport}, nil
+	return netproxy.HTTPClient(proxy, tmdbHTTPTimeout)
 }
 
 func canFallbackDirect(err error) bool {

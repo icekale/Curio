@@ -28,14 +28,16 @@ import (
 )
 
 type Service struct {
-	store         *repository.Store
-	syncMu        sync.Mutex
-	cacheMu       sync.Mutex
-	directCache   map[string]cachedDirectURL
-	directGroup   singleflight.Group
-	authMu        sync.Mutex
-	qrSessions    map[string]qrAuthSession
-	oauthSessions map[string]oauthSession
+	store            *repository.Store
+	syncMu           sync.Mutex
+	cacheMu          sync.Mutex
+	directCache      map[string]cachedDirectURL
+	directGroup      singleflight.Group
+	authMu           sync.Mutex
+	qrSessions       map[string]qrAuthSession
+	oauthSessions    map[string]oauthSession
+	tokenMu          sync.Mutex
+	lastTokenAttempt time.Time
 }
 
 type cachedDirectURL struct {
@@ -46,6 +48,22 @@ type cachedDirectURL struct {
 type directResolveResult struct {
 	URL    string
 	Source string
+}
+
+type libraryTreeItems struct {
+	Lib   LibraryConfig
+	Items []TreeItem
+}
+
+type previewLibraryItems struct {
+	Lib    LibraryConfig
+	Items  []TreeItem
+	Source string
+}
+
+type previewSample struct {
+	GroupIndex int
+	ItemIndex  int
 }
 
 type qrAuthSession struct {
@@ -67,6 +85,8 @@ type oauthSession struct {
 const (
 	defaultDirectURLTTL       = 50 * time.Minute
 	legacyDirectURLTTLSeconds = 300
+	openTokenRefreshInterval  = 12 * time.Hour
+	openTokenRefreshBackoff   = 30 * time.Minute
 )
 
 func NewService(store *repository.Store) *Service {
@@ -78,12 +98,16 @@ func NewService(store *repository.Store) *Service {
 	}
 }
 
+func (s *Service) newClient(settings models.P115Settings) *Client {
+	return NewClientWithTokenRefresh(settings, s.refreshOpenTokenForClient)
+}
+
 func (s *Service) Status(ctx context.Context) (models.P115Status, error) {
 	settings, err := s.store.P115Settings(ctx)
 	if err != nil {
 		return models.P115Status{}, err
 	}
-	return NewClient(settings).Status(ctx)
+	return s.newClient(settings).Status(ctx)
 }
 
 func (s *Service) StartQRCode(ctx context.Context) (models.P115QRCodeSession, error) {
@@ -212,6 +236,9 @@ func (s *Service) CompleteOAuth(ctx context.Context, code, state string) (models
 }
 
 func (s *Service) RefreshOpenToken(ctx context.Context) (models.P115AuthResult, error) {
+	s.tokenMu.Lock()
+	defer s.tokenMu.Unlock()
+	s.lastTokenAttempt = time.Now()
 	settings, err := s.store.P115Settings(ctx)
 	if err != nil {
 		return models.P115AuthResult{}, err
@@ -223,10 +250,42 @@ func (s *Service) RefreshOpenToken(ctx context.Context) (models.P115AuthResult, 
 	if err != nil {
 		return models.P115AuthResult{}, err
 	}
-	if err := s.saveOpenTokens(ctx, tokens.AccessToken, tokens.RefreshToken); err != nil {
+	if err := s.saveOpenTokensWithSettings(ctx, settings, tokens.AccessToken, tokens.RefreshToken); err != nil {
 		return models.P115AuthResult{}, err
 	}
 	return models.P115AuthResult{Status: "ok", Message: "115 令牌已刷新"}, nil
+}
+
+func (s *Service) refreshOpenTokenForClient(ctx context.Context, requestSettings models.P115Settings) (models.P115Settings, error) {
+	s.tokenMu.Lock()
+	defer s.tokenMu.Unlock()
+
+	settings, err := s.store.P115Settings(ctx)
+	if err != nil {
+		return requestSettings, err
+	}
+	if strings.TrimSpace(settings.RefreshToken) == "" {
+		return requestSettings, errors.New("当前没有可刷新的 115 Refresh Token")
+	}
+	if currentAccess := strings.TrimSpace(settings.AccessToken); currentAccess != "" && currentAccess != strings.TrimSpace(requestSettings.AccessToken) {
+		return settings, nil
+	}
+	s.lastTokenAttempt = time.Now()
+	runCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	tokens, err := NewClient(settings).RefreshOpenToken(runCtx)
+	if err != nil {
+		return requestSettings, err
+	}
+	updated, err := openTokensSettings(settings, tokens.AccessToken, tokens.RefreshToken)
+	if err != nil {
+		return requestSettings, err
+	}
+	if _, err := s.store.SaveP115Settings(runCtx, updated); err != nil {
+		return requestSettings, err
+	}
+	playdiag.Printf("curio p115 open token refreshed after auth failure")
+	return updated, nil
 }
 
 func (s *Service) ImportOpenToken(ctx context.Context, accessToken, refreshToken string) (models.P115AuthResult, error) {
@@ -246,24 +305,26 @@ func (s *Service) ExportTree(ctx context.Context) (models.STRMSyncResult, error)
 }
 
 func (s *Service) exportTree(ctx context.Context) (models.STRMSyncResult, error) {
-	settings, lib, err := s.settingsAndLibrary(ctx)
+	settings, libs, err := s.settingsAndLibraries(ctx)
 	if err != nil {
 		return models.STRMSyncResult{}, err
 	}
-	client := NewClient(settings)
+	client := s.newClient(settings)
 	result := models.STRMSyncResult{TreeVersion: treeVersion(), Mode: "export"}
-	items, err := client.ExportTree(ctx, lib)
-	if err != nil {
-		result.Failed++
-		return result, err
+	for _, lib := range libs {
+		items, err := client.ExportTree(ctx, lib)
+		if err != nil {
+			result.Failed++
+			return result, fmt.Errorf("CID %s 导出失败：%w", lib.CID, err)
+		}
+		items, snapshot := prepareTreeItems(lib, items, result.TreeVersion)
+		if err := s.store.ReplaceP115Snapshot(ctx, lib.CID, result.TreeVersion, snapshot); err != nil {
+			return result, err
+		}
+		result.Exported += len(items)
+		result.Skipped += countMediaTreeItems(items)
+		appendEventSummary(&result, lib, exportTreeSummary(items))
 	}
-	items, snapshot := prepareTreeItems(lib, items, result.TreeVersion)
-	if err := s.store.ReplaceP115Snapshot(ctx, lib.CID, result.TreeVersion, snapshot); err != nil {
-		return result, err
-	}
-	result.Exported += len(items)
-	result.Skipped += countMediaTreeItems(items)
-	result.EventSummary = exportTreeSummary(items)
 	return result, nil
 }
 
@@ -280,20 +341,40 @@ func (s *Service) SyncScheduled(ctx context.Context) (models.STRMSyncResult, err
 }
 
 func (s *Service) sync(ctx context.Context, fallbackBaseURL string) (models.STRMSyncResult, error) {
-	settings, lib, err := s.settingsAndLibrary(ctx)
+	settings, libs, err := s.settingsAndLibraries(ctx)
 	if err != nil {
 		return models.STRMSyncResult{}, err
 	}
-	client := NewClient(settings)
+	client := s.newClient(settings)
 	result := models.STRMSyncResult{TreeVersion: treeVersion(), Mode: "export"}
-	items, err := client.ExportTree(ctx, lib)
+	libraryItems := make([]libraryTreeItems, 0, len(libs))
+	allDesiredTargets := map[string]struct{}{}
+	targetOwners := map[string]string{}
+	for _, lib := range libs {
+		items, err := client.ExportTree(ctx, lib)
+		if err != nil {
+			result.Failed++
+			return result, fmt.Errorf("CID %s 同步失败：%w", lib.CID, err)
+		}
+		appendEventSummary(&result, lib, exportTreeSummary(items))
+		if err := collectDesiredSTRMTargets(settings, lib, items, allDesiredTargets, targetOwners); err != nil {
+			return result, err
+		}
+		libraryItems = append(libraryItems, libraryTreeItems{Lib: lib, Items: items})
+	}
+	localTargets, err := localSTRMFilesForLibraries(settings, libs)
 	if err != nil {
-		result.Failed++
 		return result, err
 	}
-	result.EventSummary = exportTreeSummary(items)
-	if err := s.applySTRMItems(ctx, settings, fallbackBaseURL, lib, items, result.TreeVersion, "export", true, &result); err != nil {
-		return result, err
+	outputRoots := libraryOutputRoots(settings, libs)
+	removedTargets := map[string]struct{}{}
+	for _, group := range libraryItems {
+		if err := s.applySTRMItems(ctx, settings, fallbackBaseURL, group.Lib, group.Items, result.TreeVersion, "export", true, localTargets, allDesiredTargets, removedTargets, &result); err != nil {
+			return result, err
+		}
+	}
+	if settings.DeleteMissingSTRM {
+		cleanupLocalSTRMOrphans(outputRoots, localTargets, allDesiredTargets, removedTargets, &result)
 	}
 	if settings.RefreshEmbyAfterSync {
 		_ = refreshEmby(ctx, settings)
@@ -327,8 +408,9 @@ func (s *Service) cleanup(ctx context.Context) (models.STRMSyncResult, error) {
 		return models.STRMSyncResult{}, err
 	}
 	result := models.STRMSyncResult{TreeVersion: treeVersion(), Mode: "cleanup"}
+	outputRoots := configuredOutputRoots(settings)
 	for _, link := range links {
-		if removeManagedSTRM(settings.STRMOutputPath, link.STRMPath) == nil {
+		if removeManagedSTRMFromRoots(outputRoots, link.STRMPath) == nil {
 			result.Deleted++
 		} else {
 			result.Failed++
@@ -336,6 +418,198 @@ func (s *Service) cleanup(ctx context.Context) (models.STRMSyncResult, error) {
 		_ = s.store.MarkSTRMLinkStatus(ctx, link.ID, models.STRMStatusDeleted, models.STRMResolveStale, "", "")
 	}
 	return result, nil
+}
+
+func (s *Service) PreviewSTRM(ctx context.Context, settings models.P115Settings, fallbackBaseURL string, limit int) (models.STRMPreview, error) {
+	if !settings.Enabled {
+		return models.STRMPreview{}, errors.New("115 播放未启用")
+	}
+	libs, err := ParseLibraryCIDs(settings.LibraryCID)
+	if err != nil {
+		return models.STRMPreview{}, err
+	}
+	libs, err = ApplyLibraryOutputRoots(libs, settings.STRMOutputPath)
+	if err != nil {
+		return models.STRMPreview{}, err
+	}
+	if limit <= 0 {
+		limit = 30
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	preview := models.STRMPreview{Limit: limit}
+	sources := map[string]struct{}{}
+	missingLibraries := 0
+	libraryItems := make([]previewLibraryItems, 0, len(libs))
+	for _, lib := range libs {
+		items, source, err := s.previewTreeItems(ctx, lib)
+		if err != nil {
+			return models.STRMPreview{}, err
+		}
+		if len(items) == 0 {
+			missingLibraries++
+			continue
+		}
+		items = s.withLibraryRootDirectory(ctx, settings, lib, items)
+		media := mediaTreeItems(items)
+		preview.Total += len(media)
+		if len(media) == 0 {
+			continue
+		}
+		if source != "" {
+			sources[source] = struct{}{}
+		}
+		libraryItems = append(libraryItems, previewLibraryItems{Lib: lib, Items: media, Source: source})
+	}
+	nonEmptyLibraries := len(libraryItems)
+	if nonEmptyLibraries > 0 && limit < nonEmptyLibraries {
+		limit = nonEmptyLibraries
+		if limit > 500 {
+			limit = 500
+		}
+	}
+	preview.Limit = limit
+	if nonEmptyLibraries > 0 {
+		version := treeVersion()
+		for _, sample := range previewSamples(libraryItems, limit) {
+			group := libraryItems[sample.GroupIndex]
+			item := group.Items[sample.ItemIndex]
+			link, err := s.linkForItem(settings, fallbackBaseURL, group.Lib, item, version)
+			if err != nil {
+				return models.STRMPreview{}, err
+			}
+			preview.Items = append(preview.Items, models.STRMPreviewItem{
+				LibraryCID:   group.Lib.CID,
+				LibraryName:  group.Lib.Name,
+				RelativePath: item.RelativePath,
+				STRMPath:     link.STRMPath,
+				PlayPath:     link.PlayPath,
+				Size:         item.Size,
+			})
+		}
+	}
+	preview.Source = joinPreviewSources(sources)
+	if preview.Total == 0 {
+		if missingLibraries > 0 {
+			preview.Message = "没有可预览的目录快照，请先刷新快照或同步 STRM"
+		} else {
+			preview.Message = "当前快照没有可生成 STRM 的媒体文件"
+		}
+	} else if len(preview.Items) < preview.Total {
+		preview.Message = fmt.Sprintf("按 %d 个 CID 轮询取样，展示前 %d 条，共 %d 条", nonEmptyLibraries, len(preview.Items), preview.Total)
+	}
+	return preview, nil
+}
+
+func previewSamples(groups []previewLibraryItems, limit int) []previewSample {
+	if limit <= 0 || len(groups) == 0 {
+		return nil
+	}
+	samples := make([]previewSample, 0, limit)
+	positions := make([]int, len(groups))
+	for groupIndex, group := range groups {
+		if len(samples) >= limit {
+			return samples
+		}
+		if len(group.Items) == 0 {
+			continue
+		}
+		samples = append(samples, previewSample{GroupIndex: groupIndex, ItemIndex: 0})
+		positions[groupIndex] = 1
+	}
+	for len(samples) < limit {
+		added := false
+		for groupIndex, group := range groups {
+			if len(samples) >= limit {
+				break
+			}
+			itemIndex := positions[groupIndex]
+			if itemIndex >= len(group.Items) {
+				continue
+			}
+			samples = append(samples, previewSample{GroupIndex: groupIndex, ItemIndex: itemIndex})
+			positions[groupIndex]++
+			added = true
+		}
+		if !added {
+			break
+		}
+	}
+	return samples
+}
+
+func mediaTreeItems(items []TreeItem) []TreeItem {
+	media := make([]TreeItem, 0, len(items))
+	for _, item := range items {
+		if isMediaTreeItem(item) {
+			media = append(media, item)
+		}
+	}
+	sort.SliceStable(media, func(i, j int) bool {
+		return normalizedRelativePath(media[i].RelativePath) < normalizedRelativePath(media[j].RelativePath)
+	})
+	return media
+}
+
+func (s *Service) previewTreeItems(ctx context.Context, lib LibraryConfig) ([]TreeItem, string, error) {
+	nodes, nodeVersion, err := s.store.P115Nodes(ctx, lib.CID, true)
+	if err != nil {
+		return nil, "", err
+	}
+	if len(nodes) > 0 {
+		_ = nodeVersion
+		return treeItemsFromNodes(nodes), "nodes", nil
+	}
+	snapshot, snapshotVersion, err := s.store.P115Snapshot(ctx, lib.CID)
+	if err != nil {
+		return nil, "", err
+	}
+	if len(snapshot) > 0 {
+		_ = snapshotVersion
+		return treeItemsFromSnapshot(snapshot), "snapshot", nil
+	}
+	return nil, "", nil
+}
+
+func (s *Service) withLibraryRootDirectory(ctx context.Context, settings models.P115Settings, lib LibraryConfig, items []TreeItem) []TreeItem {
+	rootName := libraryRootNameFromItems(lib, items)
+	if rootName == "" {
+		rootName = s.lookupLibraryRootName(ctx, settings, lib)
+	}
+	return ensureTreeItemsRootDirectory(items, rootName)
+}
+
+func libraryRootNameFromItems(lib LibraryConfig, items []TreeItem) string {
+	for _, item := range items {
+		if strings.TrimSpace(item.RemoteFileID) != "" && item.RemoteFileID == lib.CID {
+			rawName := strings.TrimSpace(item.Name)
+			if rawName == "" {
+				rawName = item.RelativePath
+			}
+			if name := normalizedRelativePath(rawName); name != "" {
+				return name
+			}
+		}
+	}
+	return ""
+}
+
+func (s *Service) lookupLibraryRootName(ctx context.Context, settings models.P115Settings, lib LibraryConfig) string {
+	client := s.newClient(settings)
+	name, err := client.directoryName(ctx, lib.CID)
+	if err != nil {
+		return ""
+	}
+	return normalizedRelativePath(name)
+}
+
+func ensureTreeItemsRootDirectory(items []TreeItem, rootName string) []TreeItem {
+	rootName = normalizedRelativePath(rootName)
+	if rootName == "" || len(items) == 0 || exportTreeHasRoot(items, rootName) {
+		return items
+	}
+	return prefixExportRootDirectory(items, rootName)
 }
 
 func (s *Service) SyncRuns(ctx context.Context, limit int) ([]models.P115SyncRun, error) {
@@ -349,14 +623,55 @@ func (s *Service) StartScheduler(ctx context.Context) {
 func (s *Service) scheduler(ctx context.Context) {
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
+	s.refreshOpenTokenIfDue(ctx)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			s.refreshOpenTokenIfDue(ctx)
 			s.runScheduledIfDue(ctx)
 		}
 	}
+}
+
+func (s *Service) refreshOpenTokenIfDue(ctx context.Context) {
+	s.tokenMu.Lock()
+	defer s.tokenMu.Unlock()
+
+	if !s.lastTokenAttempt.IsZero() && time.Since(s.lastTokenAttempt) < openTokenRefreshBackoff {
+		return
+	}
+	settings, err := s.store.P115Settings(ctx)
+	if err != nil || !openTokenNeedsRefresh(settings) {
+		return
+	}
+	s.lastTokenAttempt = time.Now()
+	runCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	tokens, err := NewClient(settings).RefreshOpenToken(runCtx)
+	if err != nil {
+		playdiag.Printf("curio p115 open token auto refresh failed err=%s", err.Error())
+		return
+	}
+	if err := s.saveOpenTokensWithSettings(runCtx, settings, tokens.AccessToken, tokens.RefreshToken); err != nil {
+		playdiag.Printf("curio p115 open token auto refresh save failed err=%s", err.Error())
+		return
+	}
+	playdiag.Printf("curio p115 open token auto refresh ok")
+}
+
+func openTokenNeedsRefresh(settings models.P115Settings) bool {
+	if strings.TrimSpace(settings.RefreshToken) == "" {
+		return false
+	}
+	if strings.TrimSpace(settings.AccessToken) == "" {
+		return true
+	}
+	if settings.OpenTokenRefreshedAt == nil || settings.OpenTokenRefreshedAt.IsZero() {
+		return true
+	}
+	return time.Since(*settings.OpenTokenRefreshedAt) >= openTokenRefreshInterval
 }
 
 func (s *Service) runScheduledIfDue(ctx context.Context) {
@@ -445,7 +760,11 @@ func (s *Service) PlayURLForLinkName(linkID, baseURL, displayName string) (strin
 	if linkID == "" {
 		return "", errors.New("STRM 链接 ID 为空")
 	}
-	return joinPublicURLReadable(baseURL, "/play/115/id/"+linkID+"/"+playRouteFileName(linkID, displayName)), nil
+	route := cleanPlayDisplayName(displayName)
+	if route == "" {
+		route = "id/" + linkID + "/" + linkID
+	}
+	return joinPublicURLReadable(baseURL, "/play/115/"+route), nil
 }
 
 func (s *Service) LinkIDFromToken(token string) (string, error) {
@@ -471,7 +790,7 @@ func (s *Service) ResolvePlayURLFromRoute(ctx context.Context, route, baseURL, r
 	if linkID := linkIDFromPlayRoute(route); linkID != "" {
 		return s.resolvePlayURLByLinkID(ctx, linkID, requestUserAgent)
 	}
-	settings, lib, err := s.settingsAndLibrary(ctx)
+	settings, libs, err := s.settingsAndLibraries(ctx)
 	if err != nil {
 		return "", err
 	}
@@ -479,11 +798,11 @@ func (s *Service) ResolvePlayURLFromRoute(ctx context.Context, route, baseURL, r
 	if err != nil {
 		return "", err
 	}
-	return s.resolvePlayURLForLink(ctx, settings, lib, link, requestUserAgent)
+	return s.resolvePlayURLForLink(ctx, settings, libs, link, requestUserAgent)
 }
 
 func (s *Service) resolvePlayURLByLinkID(ctx context.Context, linkID, requestUserAgent string) (string, error) {
-	settings, lib, err := s.settingsAndLibrary(ctx)
+	settings, libs, err := s.settingsAndLibraries(ctx)
 	if err != nil {
 		return "", err
 	}
@@ -491,19 +810,19 @@ func (s *Service) resolvePlayURLByLinkID(ctx context.Context, linkID, requestUse
 	if err != nil {
 		return "", err
 	}
-	return s.resolvePlayURLForLink(ctx, settings, lib, link, requestUserAgent)
+	return s.resolvePlayURLForLink(ctx, settings, libs, link, requestUserAgent)
 }
 
-func (s *Service) resolvePlayURLForLink(ctx context.Context, settings models.P115Settings, lib LibraryConfig, link models.STRMLink, requestUserAgent string) (string, error) {
+func (s *Service) resolvePlayURLForLink(ctx context.Context, settings models.P115Settings, libs []LibraryConfig, link models.STRMLink, requestUserAgent string) (string, error) {
 	started := time.Now()
 	if link.Provider != models.STRMProvider115 || link.Status != models.STRMStatusGenerated {
 		return "", errors.New("STRM 链接不可播放")
 	}
-	if link.LibraryCID != lib.CID {
+	if _, ok := libraryByCID(libs, link.LibraryCID); !ok {
 		_ = s.store.MarkSTRMLinkStatus(ctx, link.ID, models.STRMStatusStale, models.STRMResolveStale, "CID_NOT_CONFIGURED", "115 媒体库 CID 已不在当前配置中")
 		return "", errors.New("115 媒体库 CID 已不在当前配置中")
 	}
-	client := NewClient(settings)
+	client := s.newClient(settings)
 	if strings.TrimSpace(link.PickCode) == "" {
 		info, err := client.ResolvePath(ctx, link.LibraryCID, link.RelativePath)
 		if err != nil {
@@ -608,14 +927,27 @@ func (s *Service) oauthSession(state string) (oauthSession, error) {
 }
 
 func (s *Service) saveOpenTokens(ctx context.Context, accessToken, refreshToken string) error {
-	accessToken = strings.TrimSpace(accessToken)
-	refreshToken = strings.TrimSpace(refreshToken)
-	if accessToken == "" {
-		return errors.New("115 未返回 Access Token")
-	}
 	settings, err := s.store.P115Settings(ctx)
 	if err != nil {
 		return err
+	}
+	return s.saveOpenTokensWithSettings(ctx, settings, accessToken, refreshToken)
+}
+
+func (s *Service) saveOpenTokensWithSettings(ctx context.Context, settings models.P115Settings, accessToken, refreshToken string) error {
+	updated, err := openTokensSettings(settings, accessToken, refreshToken)
+	if err != nil {
+		return err
+	}
+	_, err = s.store.SaveP115Settings(ctx, updated)
+	return err
+}
+
+func openTokensSettings(settings models.P115Settings, accessToken, refreshToken string) (models.P115Settings, error) {
+	accessToken = strings.TrimSpace(accessToken)
+	refreshToken = strings.TrimSpace(refreshToken)
+	if accessToken == "" {
+		return models.P115Settings{}, errors.New("115 未返回 Access Token")
 	}
 	settings.Enabled = true
 	settings.AuthMode = authModeOpen
@@ -629,8 +961,9 @@ func (s *Service) saveOpenTokens(ctx context.Context, accessToken, refreshToken 
 	if settings.KeepDeletedDays <= 0 {
 		settings.KeepDeletedDays = 7
 	}
-	_, err = s.store.SaveP115Settings(ctx, settings)
-	return err
+	now := time.Now()
+	settings.OpenTokenRefreshedAt = &now
+	return settings, nil
 }
 
 func (s *Service) saveCookies(ctx context.Context, cookies string) error {
@@ -653,26 +986,38 @@ func (s *Service) saveCookies(ctx context.Context, cookies string) error {
 	return err
 }
 
-func (s *Service) settingsAndLibrary(ctx context.Context) (models.P115Settings, LibraryConfig, error) {
+func (s *Service) settingsAndLibraries(ctx context.Context) (models.P115Settings, []LibraryConfig, error) {
 	settings, err := s.store.P115Settings(ctx)
 	if err != nil {
-		return models.P115Settings{}, LibraryConfig{}, err
+		return models.P115Settings{}, nil, err
 	}
 	if !settings.Enabled {
-		return models.P115Settings{}, LibraryConfig{}, errors.New("115 播放未启用")
+		return models.P115Settings{}, nil, errors.New("115 播放未启用")
 	}
-	lib, err := ParseLibraryCID(settings.LibraryCID)
+	libs, err := ParseLibraryCIDs(settings.LibraryCID)
 	if err != nil {
-		return models.P115Settings{}, LibraryConfig{}, err
+		return models.P115Settings{}, nil, err
 	}
-	if strings.TrimSpace(settings.STRMOutputPath) == "" {
-		return models.P115Settings{}, LibraryConfig{}, errors.New("STRM 输出目录不能为空")
+	libs, err = ApplyLibraryOutputRoots(libs, settings.STRMOutputPath)
+	if err != nil {
+		return models.P115Settings{}, nil, err
 	}
-	return settings, lib, nil
+	return settings, libs, nil
+}
+
+func libraryByCID(libs []LibraryConfig, cid string) (LibraryConfig, bool) {
+	cid = strings.TrimSpace(cid)
+	for _, lib := range libs {
+		if lib.CID == cid {
+			return lib, true
+		}
+	}
+	return LibraryConfig{}, false
 }
 
 func (s *Service) linkForItem(settings models.P115Settings, fallbackBaseURL string, lib LibraryConfig, item TreeItem, version string) (models.STRMLink, error) {
-	strmPath, err := strmPathFor(settings.STRMOutputPath, lib.OutputPrefix, item.RelativePath)
+	outputRoot := libraryOutputRoot(settings, lib)
+	strmPath, err := strmPathFor(outputRoot, lib.OutputPrefix, item.RelativePath)
 	if err != nil {
 		return models.STRMLink{}, err
 	}
@@ -718,13 +1063,12 @@ func (s *Service) linkForItem(settings models.P115Settings, fallbackBaseURL stri
 	}, nil
 }
 
-func (s *Service) applySTRMItems(ctx context.Context, settings models.P115Settings, fallbackBaseURL string, lib LibraryConfig, items []TreeItem, version, sourceMode string, countExported bool, result *models.STRMSyncResult) error {
+func (s *Service) applySTRMItems(ctx context.Context, settings models.P115Settings, fallbackBaseURL string, lib LibraryConfig, items []TreeItem, version, sourceMode string, countExported bool, localTargets map[string]string, desiredTargets, removedTargets map[string]struct{}, result *models.STRMSyncResult) error {
 	items, _ = prepareTreeItems(lib, items, version)
 	if countExported {
 		result.Exported += len(items)
 	}
 	seen := map[string]struct{}{}
-	desiredTargets := map[string]struct{}{}
 	for _, item := range items {
 		if isMediaTreeItem(item) {
 			seen[item.RelativePath] = struct{}{}
@@ -738,19 +1082,20 @@ func (s *Service) applySTRMItems(ctx context.Context, settings models.P115Settin
 	for _, link := range existing {
 		existingByPath[link.RelativePath] = link
 	}
-	localTargets, err := localSTRMFiles(settings.STRMOutputPath, lib.OutputPrefix)
-	if err != nil {
-		return err
+	if localTargets == nil {
+		var err error
+		localTargets, err = localSTRMFiles(libraryOutputRoot(settings, lib), lib.OutputPrefix)
+		if err != nil {
+			return err
+		}
 	}
-	desiredRelativePaths := desiredMediaRelativePaths(items)
-	if prefix, matched, total, ok := detectRelativePrefixShift(strmLinkRelativePaths(existing), desiredRelativePaths); ok {
-		return fmt.Errorf("检测到 115 目录树疑似多出顶层目录 %q：%d/%d 个现有 STRM 可在该目录下匹配。已中止同步以保护现有 STRM，请确认媒体库 CID 是否指向根目录本身", prefix, matched, total)
+	outputRoot := libraryOutputRoot(settings, lib)
+	if desiredTargets == nil {
+		desiredTargets = map[string]struct{}{}
 	}
-	desiredSTRMPaths := desiredSTRMRelativePaths(items)
-	if prefix, matched, total, ok := detectRelativePrefixShift(localSTRMRelativePaths(settings.STRMOutputPath, lib.OutputPrefix, localTargets), desiredSTRMPaths); ok {
-		return fmt.Errorf("检测到本地 STRM 目标疑似整体多出顶层目录 %q：%d/%d 个现有文件可在该目录下匹配。已中止同步以保护现有 STRM", prefix, matched, total)
+	if removedTargets == nil {
+		removedTargets = map[string]struct{}{}
 	}
-	removedTargets := map[string]struct{}{}
 	for _, item := range items {
 		if !isMediaTreeItem(item) {
 			continue
@@ -775,7 +1120,7 @@ func (s *Service) applySTRMItems(ctx context.Context, settings models.P115Settin
 		if !localExists {
 			localExists = fileExists(link.STRMPath)
 		}
-		wrote, err := writeSTRM(settings.STRMOutputPath, link.STRMPath, link.PlayPath)
+		wrote, err := writeSTRM(outputRoot, link.STRMPath, link.PlayPath)
 		if err != nil {
 			result.Failed++
 			_ = s.store.MarkSTRMLinkStatus(ctx, link.ID, models.STRMStatusFailed, models.STRMResolveFailed, "STRM_WRITE_FAILED", err.Error())
@@ -786,10 +1131,13 @@ func (s *Service) applySTRMItems(ctx context.Context, settings models.P115Settin
 			continue
 		}
 		if existed && old.STRMPath != "" && cleanPathKey(old.STRMPath) != targetKey {
-			if err := removeManagedSTRM(settings.STRMOutputPath, old.STRMPath); err == nil {
-				removedTargets[cleanPathKey(old.STRMPath)] = struct{}{}
-			} else {
-				result.Failed++
+			oldTargetKey := cleanPathKey(old.STRMPath)
+			if _, protectedTarget := desiredTargets[oldTargetKey]; !protectedTarget {
+				if err := removeManagedSTRM(outputRoot, old.STRMPath); err == nil {
+					removedTargets[oldTargetKey] = struct{}{}
+				} else {
+					result.Failed++
+				}
 			}
 		}
 		if !existed {
@@ -807,26 +1155,12 @@ func (s *Service) applySTRMItems(ctx context.Context, settings models.P115Settin
 			if _, ok := seen[link.RelativePath]; ok {
 				continue
 			}
-			if err := s.markMissing(ctx, settings, link); err != nil {
+			_, protectedTarget := desiredTargets[cleanPathKey(link.STRMPath)]
+			if err := s.markMissing(ctx, settings, lib, link, !protectedTarget); err != nil {
 				result.Failed++
 				continue
 			}
 			removedTargets[cleanPathKey(link.STRMPath)] = struct{}{}
-			result.Deleted++
-		}
-	}
-	if settings.DeleteMissingSTRM {
-		for targetKey, target := range localTargets {
-			if _, ok := desiredTargets[targetKey]; ok {
-				continue
-			}
-			if _, ok := removedTargets[targetKey]; ok {
-				continue
-			}
-			if err := removeManagedSTRM(settings.STRMOutputPath, target); err != nil {
-				result.Failed++
-				continue
-			}
 			result.Deleted++
 		}
 	}
@@ -1867,7 +2201,17 @@ func pathDepth(value string) int {
 func prepareTreeItems(lib LibraryConfig, items []TreeItem, version string) ([]TreeItem, []models.P115TreeSnapshotItem) {
 	prepared := make([]TreeItem, 0, len(items))
 	snapshot := make([]models.P115TreeSnapshotItem, 0, len(items))
+	seen := map[string]struct{}{}
 	for _, item := range items {
+		relativePath := normalizedRelativePath(item.RelativePath)
+		if relativePath == "" {
+			continue
+		}
+		if _, ok := seen[relativePath]; ok {
+			continue
+		}
+		seen[relativePath] = struct{}{}
+		item.RelativePath = relativePath
 		item.SourceTreeHash = sourceHash(lib.CID, item.RelativePath, item.RemoteFileID, item.PickCode, item.SHA1, item.Size)
 		media := isMediaTreeItem(item)
 		extension := strings.TrimPrefix(strings.ToLower(path.Ext(item.Name)), ".")
@@ -1926,6 +2270,121 @@ func exportTreeSummary(items []TreeItem) string {
 	return fmt.Sprintf("source=export_dir items=%d media=%d", len(items), countMediaTreeItems(items))
 }
 
+func appendEventSummary(result *models.STRMSyncResult, lib LibraryConfig, summary string) {
+	summary = strings.TrimSpace(summary)
+	if summary == "" {
+		return
+	}
+	part := fmt.Sprintf("cid=%s %s", lib.CID, summary)
+	if result.EventSummary == "" {
+		result.EventSummary = part
+		return
+	}
+	result.EventSummary += " | " + part
+}
+
+func joinPreviewSources(sources map[string]struct{}) string {
+	if len(sources) == 0 {
+		return ""
+	}
+	values := make([]string, 0, len(sources))
+	for source := range sources {
+		values = append(values, source)
+	}
+	sort.Strings(values)
+	return strings.Join(values, ",")
+}
+
+func collectDesiredSTRMTargets(settings models.P115Settings, lib LibraryConfig, items []TreeItem, desiredTargets map[string]struct{}, targetOwners map[string]string) error {
+	outputRoot := libraryOutputRoot(settings, lib)
+	for _, item := range items {
+		if !isMediaTreeItem(item) {
+			continue
+		}
+		target, err := strmPathFor(outputRoot, lib.OutputPrefix, item.RelativePath)
+		if err != nil {
+			return err
+		}
+		key := cleanPathKey(target)
+		if owner := targetOwners[key]; owner != "" && owner != lib.CID {
+			return fmt.Errorf("多个 115 CID 会生成同一个 STRM 路径：%s（CID %s 与 %s）", target, owner, lib.CID)
+		}
+		targetOwners[key] = lib.CID
+		desiredTargets[key] = struct{}{}
+	}
+	return nil
+}
+
+func cleanupLocalSTRMOrphans(roots []string, localTargets map[string]string, desiredTargets, removedTargets map[string]struct{}, result *models.STRMSyncResult) {
+	for targetKey, target := range localTargets {
+		if _, ok := desiredTargets[targetKey]; ok {
+			continue
+		}
+		if _, ok := removedTargets[targetKey]; ok {
+			continue
+		}
+		if err := removeManagedSTRMFromRoots(roots, target); err != nil {
+			result.Failed++
+			continue
+		}
+		result.Deleted++
+	}
+}
+
+func libraryOutputRoot(settings models.P115Settings, lib LibraryConfig) string {
+	if root := strings.TrimSpace(lib.OutputRoot); root != "" {
+		return root
+	}
+	roots := SplitSTRMOutputPaths(settings.STRMOutputPath)
+	if len(roots) > 0 {
+		return roots[0]
+	}
+	return strings.TrimSpace(settings.STRMOutputPath)
+}
+
+func libraryOutputRoots(settings models.P115Settings, libs []LibraryConfig) []string {
+	roots := make([]string, 0, len(libs))
+	seen := map[string]struct{}{}
+	for _, lib := range libs {
+		root := libraryOutputRoot(settings, lib)
+		if strings.TrimSpace(root) == "" {
+			continue
+		}
+		key := cleanPathKey(root)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		roots = append(roots, root)
+	}
+	return roots
+}
+
+func configuredOutputRoots(settings models.P115Settings) []string {
+	roots := SplitSTRMOutputPaths(settings.STRMOutputPath)
+	if len(roots) > 0 {
+		return roots
+	}
+	if root := strings.TrimSpace(settings.STRMOutputPath); root != "" {
+		return []string{root}
+	}
+	return nil
+}
+
+func localSTRMFilesForLibraries(settings models.P115Settings, libs []LibraryConfig) (map[string]string, error) {
+	files := map[string]string{}
+	for _, root := range libraryOutputRoots(settings, libs) {
+		rootFiles, err := localSTRMFiles(root, "")
+		if err != nil {
+			return nil, err
+		}
+		for key, target := range rootFiles {
+			files[key] = target
+		}
+	}
+	return files, nil
+}
+
 func playBaseURL(settings models.P115Settings, fallbackBaseURL string) string {
 	if value := strings.TrimSpace(settings.PublicBaseURL); value != "" {
 		return value
@@ -1933,10 +2392,12 @@ func playBaseURL(settings models.P115Settings, fallbackBaseURL string) string {
 	return fallbackBaseURL
 }
 
-func (s *Service) markMissing(ctx context.Context, settings models.P115Settings, link models.STRMLink) error {
+func (s *Service) markMissing(ctx context.Context, settings models.P115Settings, lib LibraryConfig, link models.STRMLink, removePhysical bool) error {
 	if settings.DeleteMissingSTRM && !(settings.StaleBeforeDelete && link.Status == models.STRMStatusGenerated) {
-		if err := removeManagedSTRM(settings.STRMOutputPath, link.STRMPath); err != nil {
-			return err
+		if removePhysical {
+			if err := removeManagedSTRM(libraryOutputRoot(settings, lib), link.STRMPath); err != nil {
+				return err
+			}
 		}
 		return s.store.MarkSTRMLinkStatus(ctx, link.ID, models.STRMStatusDeleted, models.STRMResolveStale, "", "")
 	}
@@ -2089,6 +2550,18 @@ func removeManagedSTRM(root, target string) error {
 	return nil
 }
 
+func removeManagedSTRMFromRoots(roots []string, target string) error {
+	if strings.TrimSpace(target) == "" {
+		return nil
+	}
+	for _, root := range roots {
+		if insideRoot(root, target) {
+			return removeManagedSTRM(root, target)
+		}
+	}
+	return errors.New("拒绝删除 STRM 输出目录外的文件")
+}
+
 func localSTRMFiles(root, outputPrefix string) (map[string]string, error) {
 	files := map[string]string{}
 	start := root
@@ -2124,149 +2597,6 @@ func localSTRMFiles(root, outputPrefix string) (map[string]string, error) {
 		return nil, err
 	}
 	return files, nil
-}
-
-func desiredMediaRelativePaths(items []TreeItem) []string {
-	paths := make([]string, 0, len(items))
-	seen := map[string]struct{}{}
-	for _, item := range items {
-		if !isMediaTreeItem(item) {
-			continue
-		}
-		addUniqueRelativePath(&paths, seen, item.RelativePath)
-	}
-	return paths
-}
-
-func desiredSTRMRelativePaths(items []TreeItem) []string {
-	paths := make([]string, 0, len(items))
-	seen := map[string]struct{}{}
-	for _, item := range items {
-		if !isMediaTreeItem(item) {
-			continue
-		}
-		rel := normalizedRelativePath(item.RelativePath)
-		if rel == "" {
-			continue
-		}
-		ext := path.Ext(rel)
-		if ext == "" {
-			continue
-		}
-		addUniqueRelativePath(&paths, seen, strings.TrimSuffix(rel, ext)+".strm")
-	}
-	return paths
-}
-
-func strmLinkRelativePaths(links []models.STRMLink) []string {
-	paths := make([]string, 0, len(links))
-	seen := map[string]struct{}{}
-	for _, link := range links {
-		addUniqueRelativePath(&paths, seen, link.RelativePath)
-	}
-	return paths
-}
-
-func localSTRMRelativePaths(root, outputPrefix string, localTargets map[string]string) []string {
-	base := root
-	for _, part := range splitRelativePath(outputPrefix) {
-		base = filepath.Join(base, part)
-	}
-	baseAbs, err := filepath.Abs(base)
-	if err != nil {
-		return nil
-	}
-	paths := make([]string, 0, len(localTargets))
-	seen := map[string]struct{}{}
-	for _, target := range localTargets {
-		targetAbs, err := filepath.Abs(target)
-		if err != nil {
-			continue
-		}
-		rel, err := filepath.Rel(baseAbs, targetAbs)
-		if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			continue
-		}
-		addUniqueRelativePath(&paths, seen, filepath.ToSlash(rel))
-	}
-	return paths
-}
-
-func detectRelativePrefixShift(existing, desired []string) (string, int, int, bool) {
-	desiredSet := map[string]struct{}{}
-	for _, rel := range desired {
-		if rel = normalizedRelativePath(rel); rel != "" {
-			desiredSet[rel] = struct{}{}
-		}
-	}
-	if len(desiredSet) == 0 {
-		return "", 0, 0, false
-	}
-	existingSet := map[string]struct{}{}
-	for _, rel := range existing {
-		if rel = normalizedRelativePath(rel); rel != "" {
-			existingSet[rel] = struct{}{}
-		}
-	}
-	prefixMatches := map[string]int{}
-	total := 0
-	for rel := range existingSet {
-		if _, unchanged := desiredSet[rel]; unchanged {
-			continue
-		}
-		total++
-		for desiredRel := range desiredSet {
-			prefix, ok := shiftedPrefix(rel, desiredRel)
-			if ok {
-				prefixMatches[prefix]++
-			}
-		}
-	}
-	if total == 0 {
-		return "", 0, 0, false
-	}
-	bestPrefix := ""
-	bestMatched := 0
-	for prefix, matched := range prefixMatches {
-		if matched > bestMatched || (matched == bestMatched && prefix < bestPrefix) {
-			bestPrefix = prefix
-			bestMatched = matched
-		}
-	}
-	if bestMatched == 0 {
-		return "", 0, total, false
-	}
-	if total >= 20 && bestMatched*100 >= total*80 {
-		return bestPrefix, bestMatched, total, true
-	}
-	if total >= 3 && bestMatched == total {
-		return bestPrefix, bestMatched, total, true
-	}
-	return "", bestMatched, total, false
-}
-
-func shiftedPrefix(existingRel, desiredRel string) (string, bool) {
-	suffix := "/" + existingRel
-	if !strings.HasSuffix(desiredRel, suffix) {
-		return "", false
-	}
-	prefix := normalizedRelativePath(strings.TrimSuffix(desiredRel, suffix))
-	if prefix == "" {
-		return "", false
-	}
-	return prefix, true
-}
-
-func addUniqueRelativePath(paths *[]string, seen map[string]struct{}, rel string) {
-	rel = normalizedRelativePath(rel)
-	if rel == "" {
-		return
-	}
-	if _, ok := seen[rel]; ok {
-		return
-	}
-	seen[rel] = struct{}{}
-	*paths = append(*paths, rel)
 }
 
 func normalizedRelativePath(value string) string {
@@ -2418,15 +2748,6 @@ func linkIDFromPlayRoute(route string) string {
 		rest = rest[:cut]
 	}
 	return strings.TrimSpace(rest)
-}
-
-func playRouteFileName(linkID, displayName string) string {
-	name := cleanPlayDisplayName(displayName)
-	ext := strings.ToLower(path.Ext(name))
-	if ext != "" && mediaExtension(ext) {
-		return linkID + ext
-	}
-	return linkID
 }
 
 func playPathCandidates(baseURL, route string) []string {

@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"path"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,36 +32,59 @@ type Proxy struct {
 	prewarmMu        sync.Mutex
 	prewarmRecent    map[string]time.Time
 	prewarmSlots     chan struct{}
+	mediaProbeMu     sync.Mutex
+	mediaProbeRecent map[string]time.Time
+	mediaProbeSlots  chan struct{}
 	playbackMu       sync.Mutex
 	playbackSessions map[string]playbackSessionState
+	progressSaveMu   sync.Mutex
+	progressSaves    map[string]playbackProgressSaveState
+	protectMu        sync.Mutex
+	protectRecent    map[string]time.Time
+	manualClearMu    sync.Mutex
+	manualClears     map[string]time.Time
 }
 
 var (
 	playbackInfoPattern           = regexp.MustCompile(`(?i)^/?Items/([^/]+)/PlaybackInfo/?$`)
-	itemPathPattern               = regexp.MustCompile(`(?i)^/?(?:Users/[^/]+/)?Items(?:/[^/]+)?/?$|^/?Users/[^/]+/Items/Latest/?$`)
+	itemPathPattern               = regexp.MustCompile(`(?i)^/?(?:Users/[^/]+/)?Items(?:/[^/]+)?/?$|^/?Users/[^/]+/Items/Latest/?$|^/?Shows/NextUp/?$|^/?Shows/[^/]+/Episodes/?$`)
+	resumeItemsPattern            = regexp.MustCompile(`(?i)^/?Users/[^/]+/Items/Resume/?$`)
 	streamPattern                 = regexp.MustCompile(`(?i)^/?(?:Videos|Audio)/([^/]+)/(?:stream|universal|original)(?:\.[^/]+)?(?:/|$)|^/?(?:Videos|Audio)/([^/]+)/(?:master\.m3u8|hls|main\.m3u8)(?:/|$)`)
 	downloadPattern               = regexp.MustCompile(`(?i)^/?Items/([^/]+)/Download(?:/|$)|^/?Videos/([^/]+)/Download(?:/|$)`)
 	itemDetailPattern             = regexp.MustCompile(`(?i)^/?(?:Users/[^/]+/)?Items/([^/]+)/?$`)
 	sessionPlayingPattern         = regexp.MustCompile(`(?i)^/?Sessions/Playing/?$`)
 	sessionPlayingProgressPattern = regexp.MustCompile(`(?i)^/?Sessions/Playing/Progress/?$`)
 	sessionPlayingStoppedPattern  = regexp.MustCompile(`(?i)^/?Sessions/Playing/Stopped/?$`)
+	userPathPattern               = regexp.MustCompile(`(?i)^/?Users/([^/]+)(?:/|$)`)
 	legacyPlayingItemPattern      = regexp.MustCompile(`(?i)^/?Users/([^/]+)/PlayingItems/([^/]+)/?$`)
 	legacyPlayingProgressPattern  = regexp.MustCompile(`(?i)^/?Users/([^/]+)/PlayingItems/([^/]+)/Progress/?$`)
 	legacyPlayingStoppedPattern   = regexp.MustCompile(`(?i)^/?Users/([^/]+)/PlayingItems/([^/]+)/(?:Delete|Stopped)/?$`)
+	userDataPattern               = regexp.MustCompile(`(?i)^/?Users/([^/]+)/Items/([^/]+)/UserData/?$`)
+	playedItemPattern             = regexp.MustCompile(`(?i)^/?Users/([^/]+)/PlayedItems/([^/]+)(?:/(Delete))?/?$`)
 )
 
 const (
-	publicBaseHeader       = "X-Curio-Public-Base"
-	proxyBasePathHeader    = "X-Curio-Proxy-Base-Path"
-	playbackPrewarmTimeout = 20 * time.Second
-	prewarmDedupeWindow    = 30 * time.Second
-	prewarmMaxConcurrent   = 2
-	adjacentPrewarmLimit   = 1
-	embyTickPerSecond      = int64(10000000)
-	playbackShortStopTicks = 60 * embyTickPerSecond
-	playbackResumeTicks    = 10 * embyTickPerSecond
-	playbackStateTTL       = 6 * time.Hour
-	embyCorrectionTimeout  = 8 * time.Second
+	publicBaseHeader        = "X-Curio-Public-Base"
+	proxyBasePathHeader     = "X-Curio-Proxy-Base-Path"
+	playbackPrewarmTimeout  = 20 * time.Second
+	prewarmDedupeWindow     = 30 * time.Second
+	prewarmMaxConcurrent    = 2
+	mediaProbeTimeout       = 75 * time.Second
+	mediaProbeDedupeWindow  = 10 * time.Minute
+	mediaProbeStartDelay    = 5 * time.Second
+	mediaProbeMaxConcurrent = 1
+	adjacentPrewarmLimit    = 1
+	embyTickPerSecond       = int64(10000000)
+	playbackPositionSlack   = 5 * embyTickPerSecond
+	playbackShortStopTicks  = 60 * embyTickPerSecond
+	playbackResumeTicks     = 10 * embyTickPerSecond
+	playbackStateTTL        = 6 * time.Hour
+	progressSaveInterval    = 15 * time.Second
+	progressSaveMinDelta    = 30 * embyTickPerSecond
+	playbackProtectInterval = 20 * time.Second
+	manualClearTTL          = 30 * time.Minute
+	embyCorrectionTimeout   = 8 * time.Second
+	embyUserDataTimeout     = 3 * time.Second
 )
 
 func New(store *repository.Store, play *p115.Service) *Proxy {
@@ -69,7 +93,12 @@ func New(store *repository.Store, play *p115.Service) *Proxy {
 		play:             play,
 		prewarmRecent:    map[string]time.Time{},
 		prewarmSlots:     make(chan struct{}, prewarmMaxConcurrent),
+		mediaProbeRecent: map[string]time.Time{},
+		mediaProbeSlots:  make(chan struct{}, mediaProbeMaxConcurrent),
 		playbackSessions: map[string]playbackSessionState{},
+		progressSaves:    map[string]playbackProgressSaveState{},
+		protectRecent:    map[string]time.Time{},
+		manualClears:     map[string]time.Time{},
 	}
 }
 
@@ -85,6 +114,10 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.HasPrefix(strings.TrimLeft(r.URL.Path, "/"), "play/115/") {
 		p.servePlay115(w, r, settings)
+		return
+	}
+	if route, ok := manualPlaybackUpdateRoute(r.Method, proxyPath(settings, r.URL.Path)); ok {
+		p.serveManualPlaybackUpdate(w, r, settings, route)
 		return
 	}
 	if route, ok := playbackCheckinRoute(r.Method, proxyPath(settings, r.URL.Path)); ok {
@@ -160,6 +193,19 @@ type playbackCheckinRouteInfo struct {
 	ItemID string
 }
 
+type manualPlaybackUpdateKind string
+
+const (
+	manualPlaybackUpdateUserData     manualPlaybackUpdateKind = "userdata"
+	manualPlaybackUpdatePlayedDelete manualPlaybackUpdateKind = "played_delete"
+)
+
+type manualPlaybackUpdateRouteInfo struct {
+	Kind   manualPlaybackUpdateKind
+	UserID string
+	ItemID string
+}
+
 type playbackCheckin struct {
 	Kind              playbackCheckinKind
 	UserID            string
@@ -180,15 +226,23 @@ type playbackCheckin struct {
 }
 
 type playbackSessionState struct {
-	UserID            string
-	ItemID            string
-	MediaSourceID     string
-	PlaySessionID     string
-	LinkID            string
-	RunTimeTicks      int64
-	LastPositionTicks int64
-	MaxPositionTicks  int64
-	UpdatedAt         time.Time
+	UserID                string
+	ItemID                string
+	MediaSourceID         string
+	PlaySessionID         string
+	LinkID                string
+	RunTimeTicks          int64
+	LastPositionTicks     int64
+	MaxPositionTicks      int64
+	StartedAt             time.Time
+	InitialPlayed         bool
+	HasInitialPlayed      bool
+	InitialPositionTicks  int64
+	HasInitialPosition    bool
+	FreshStartCleared     bool
+	FreshStartResumeTicks int64
+	FreshStartClearedAt   time.Time
+	UpdatedAt             time.Time
 }
 
 type playbackCorrectionAction string
@@ -204,6 +258,17 @@ type playbackCorrectionDecision struct {
 	PositionTicks int64
 	RunTimeTicks  int64
 	Reason        string
+}
+
+type playbackProgressSaveState struct {
+	SavedAt       time.Time
+	PositionTicks int64
+}
+
+type embyPlaybackUserData struct {
+	PlaybackPositionTicks int64
+	Played                bool
+	HasPlayed             bool
 }
 
 type responseStatusRecorder struct {
@@ -270,6 +335,9 @@ func (p *Proxy) servePlaybackCheckin(w http.ResponseWriter, r *http.Request, set
 	state := playbackSessionState{}
 	if mapped {
 		state = p.rememberPlaybackCheckin(checkin, link)
+		if checkin.Kind == playbackCheckinPlaying {
+			state = p.rememberInitialPlaybackUserData(settings, backgroundPlaybackRequest(r), checkin, state)
+		}
 		if nextBody, changed := rewritePlaybackCheckinBodyPosition(body, checkin, state); changed {
 			body = nextBody
 			checkin.PositionTicks = state.LastPositionTicks
@@ -284,9 +352,105 @@ func (p *Proxy) servePlaybackCheckin(w http.ResponseWriter, r *http.Request, set
 	recorder := &responseStatusRecorder{ResponseWriter: w}
 	p.reverseProxy(settings).ServeHTTP(recorder, r)
 
+	if mapped && checkin.Kind == playbackCheckinPlaying {
+		p.clearResumeOnFreshStart(settings, backgroundPlaybackRequest(r), checkin, state, recorder.StatusCode())
+	}
+	if mapped && (checkin.Kind == playbackCheckinPlaying || checkin.Kind == playbackCheckinProgress) {
+		p.protectEarlyPlayback(settings, backgroundPlaybackRequest(r), checkin, state, recorder.StatusCode())
+	}
+	if mapped && checkin.Kind == playbackCheckinProgress {
+		p.savePlaybackProgress(settings, backgroundPlaybackRequest(r), checkin, state, recorder.StatusCode())
+	}
 	if mapped && checkin.Kind == playbackCheckinStopped {
 		p.correctStoppedPlayback(settings, r, checkin, state, recorder.StatusCode())
 		p.forgetPlaybackCheckin(checkin, state)
+	}
+}
+
+func (p *Proxy) serveManualPlaybackUpdate(w http.ResponseWriter, r *http.Request, settings models.P115Settings, route manualPlaybackUpdateRouteInfo) {
+	var body []byte
+	var err error
+	if r.Body != nil {
+		body, err = io.ReadAll(r.Body)
+	}
+	if err != nil {
+		playdiag.Printf("curio emby manual playback update read failed kind=%s item=%q user=%q path=%q request_ua=%q err=%s",
+			route.Kind, route.ItemID, route.UserID, r.URL.RequestURI(), r.UserAgent(), err.Error())
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if r.Body != nil {
+		_ = r.Body.Close()
+	}
+	manualClear := manualPlaybackUpdateClearsResume(route, r.Method, body)
+	restoreRequestBody(r, body)
+	recorder := &responseStatusRecorder{ResponseWriter: w}
+	p.reverseProxy(settings).ServeHTTP(recorder, r)
+	if !manualClear || recorder.StatusCode() < http.StatusOK || recorder.StatusCode() >= http.StatusBadRequest {
+		return
+	}
+	p.rememberManualPlaybackClear(route.UserID, route.ItemID, time.Now())
+	ctx, cancel := context.WithTimeout(context.Background(), embyCorrectionTimeout)
+	defer cancel()
+	p.clearPlaybackProgressLedger(ctx, route.UserID, route.ItemID, "manual_clear")
+	if err := p.embyClearResume(ctx, settings, backgroundPlaybackRequest(r), route.UserID, route.ItemID); err != nil {
+		playdiag.Printf("curio emby manual playback clear failed kind=%s item=%q user=%q status=%d path=%q request_ua=%q err=%s",
+			route.Kind, route.ItemID, route.UserID, recorder.StatusCode(), r.URL.RequestURI(), r.UserAgent(), err.Error())
+		return
+	}
+	playdiag.Printf("curio emby manual playback clear ok kind=%s item=%q user=%q status=%d path=%q request_ua=%q",
+		route.Kind, route.ItemID, route.UserID, recorder.StatusCode(), r.URL.RequestURI(), r.UserAgent())
+}
+
+func backgroundPlaybackRequest(r *http.Request) *http.Request {
+	if r == nil {
+		return nil
+	}
+	clone := r.Clone(context.Background())
+	clone.Body = nil
+	return clone
+}
+
+func (p *Proxy) rememberInitialPlaybackUserData(settings models.P115Settings, r *http.Request, checkin playbackCheckin, state playbackSessionState) playbackSessionState {
+	itemID := firstNonEmpty(checkin.ItemID, state.ItemID)
+	userIDs := playbackCorrectionUserIDs(checkin, state)
+	if p == nil || itemID == "" || len(userIDs) == 0 {
+		return state
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), embyUserDataTimeout)
+	defer cancel()
+	userData, err := p.embyItemUserData(ctx, settings, r, userIDs[0], itemID)
+	if err != nil {
+		return state
+	}
+	if userData.HasPlayed {
+		state.InitialPlayed = userData.Played
+		state.HasInitialPlayed = true
+	}
+	state.InitialPositionTicks = userData.PlaybackPositionTicks
+	state.HasInitialPosition = true
+	p.updatePlaybackSessionState(state)
+	return state
+}
+
+func (p *Proxy) updatePlaybackSessionState(state playbackSessionState) {
+	if p == nil {
+		return
+	}
+	p.playbackMu.Lock()
+	defer p.playbackMu.Unlock()
+	if p.playbackSessions == nil {
+		p.playbackSessions = map[string]playbackSessionState{}
+	}
+	state.UpdatedAt = time.Now()
+	for _, key := range playbackSessionKeys(state.UserID, state.ItemID, state.PlaySessionID) {
+		if key == "" {
+			continue
+		}
+		if existing, ok := p.playbackSessions[key]; ok {
+			state = mergePlaybackState(existing, state)
+		}
+		p.playbackSessions[key] = state
 	}
 }
 
@@ -298,6 +462,53 @@ func restoreRequestBody(r *http.Request, body []byte) {
 	} else {
 		r.Header.Del("Content-Length")
 	}
+}
+
+func manualPlaybackUpdateRoute(method, raw string) (manualPlaybackUpdateRouteInfo, bool) {
+	if cut := strings.IndexAny(raw, "?#"); cut >= 0 {
+		raw = raw[:cut]
+	}
+	cleaned := strings.TrimLeft(raw, "/")
+	if match := userDataPattern.FindStringSubmatch(cleaned); len(match) == 3 {
+		if strings.EqualFold(method, http.MethodPost) || strings.EqualFold(method, http.MethodPut) || strings.EqualFold(method, http.MethodPatch) || strings.EqualFold(method, http.MethodDelete) {
+			return manualPlaybackUpdateRouteInfo{Kind: manualPlaybackUpdateUserData, UserID: unescapePathValue(match[1]), ItemID: unescapePathValue(match[2])}, true
+		}
+	}
+	if match := playedItemPattern.FindStringSubmatch(cleaned); len(match) == 4 {
+		if strings.EqualFold(method, http.MethodDelete) || (strings.EqualFold(method, http.MethodPost) && strings.EqualFold(match[3], "Delete")) {
+			return manualPlaybackUpdateRouteInfo{Kind: manualPlaybackUpdatePlayedDelete, UserID: unescapePathValue(match[1]), ItemID: unescapePathValue(match[2])}, true
+		}
+	}
+	return manualPlaybackUpdateRouteInfo{}, false
+}
+
+func manualPlaybackUpdateClearsResume(route manualPlaybackUpdateRouteInfo, method string, body []byte) bool {
+	if route.UserID == "" || route.ItemID == "" {
+		return false
+	}
+	if route.Kind == manualPlaybackUpdatePlayedDelete || strings.EqualFold(method, http.MethodDelete) {
+		return true
+	}
+	if route.Kind != manualPlaybackUpdateUserData {
+		return false
+	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		return false
+	}
+	var payload map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	if err := decoder.Decode(&payload); err != nil {
+		return false
+	}
+	if position, ok := int64FromAny(payload["PlaybackPositionTicks"]); ok && position <= 0 {
+		return true
+	}
+	if played, ok := boolFromAny(payload["Played"]); ok && !played {
+		position, hasPosition := int64FromAny(payload["PlaybackPositionTicks"])
+		return !hasPosition || position <= 0
+	}
+	return false
 }
 
 func playbackCheckinRoute(method, raw string) (playbackCheckinRouteInfo, bool) {
@@ -433,7 +644,7 @@ func (p *Proxy) mergePlaybackCheckinState(checkin playbackCheckin) playbackCheck
 	if !ok {
 		return checkin
 	}
-	checkin.UserID = firstNonEmpty(checkin.UserID, state.UserID)
+	checkin.UserID = preferredPlaybackUserID(checkin.UserID, state.UserID)
 	checkin.ItemID = firstNonEmpty(checkin.ItemID, state.ItemID)
 	checkin.MediaSourceID = firstNonEmpty(checkin.MediaSourceID, state.MediaSourceID)
 	checkin.PlaySessionID = firstNonEmpty(checkin.PlaySessionID, state.PlaySessionID)
@@ -481,10 +692,14 @@ func (p *Proxy) rememberPlaybackCheckin(checkin playbackCheckin, link models.STR
 		PlaySessionID: checkin.PlaySessionID,
 		LinkID:        firstNonEmpty(checkin.LinkID, link.ID),
 		RunTimeTicks:  firstPositiveI64(checkin.RunTimeTicks, link.MediaDurationTicks),
+		StartedAt:     now,
 		UpdatedAt:     now,
 	}
 	for _, key := range playbackSessionKeys(checkin.UserID, checkin.ItemID, checkin.PlaySessionID) {
 		if existing, ok := p.playbackSessions[key]; ok {
+			if checkin.Kind == playbackCheckinPlaying && p.playbackStateWasManuallyClearedLocked(existing, checkin.UserID, checkin.ItemID, now) {
+				continue
+			}
 			state = mergePlaybackState(existing, state)
 			break
 		}
@@ -502,6 +717,38 @@ func (p *Proxy) rememberPlaybackCheckin(checkin playbackCheckin, link models.STR
 	return state
 }
 
+func (p *Proxy) rememberPlaybackRequestContext(r *http.Request, itemID string, link models.STRMLink) {
+	if p == nil {
+		return
+	}
+	userID := playbackRequestUserID(r)
+	if userID == "" || strings.TrimSpace(itemID) == "" {
+		return
+	}
+	state := playbackSessionState{
+		UserID:       userID,
+		ItemID:       strings.TrimSpace(itemID),
+		LinkID:       link.ID,
+		RunTimeTicks: link.MediaDurationTicks,
+		UpdatedAt:    time.Now(),
+	}
+	p.playbackMu.Lock()
+	defer p.playbackMu.Unlock()
+	if p.playbackSessions == nil {
+		p.playbackSessions = map[string]playbackSessionState{}
+	}
+	cleanupPlaybackSessionsLocked(p.playbackSessions, state.UpdatedAt)
+	for _, key := range playbackSessionKeys(state.UserID, state.ItemID, "") {
+		if existing, ok := p.playbackSessions[key]; ok {
+			state = mergePlaybackState(existing, state)
+			break
+		}
+	}
+	for _, key := range playbackSessionKeys(state.UserID, state.ItemID, "") {
+		p.playbackSessions[key] = state
+	}
+}
+
 func (p *Proxy) forgetPlaybackCheckin(checkin playbackCheckin, state playbackSessionState) {
 	if p == nil {
 		return
@@ -515,6 +762,7 @@ func (p *Proxy) forgetPlaybackCheckin(checkin playbackCheckin, state playbackSes
 
 func mergePlaybackState(existing, next playbackSessionState) playbackSessionState {
 	next.UserID = firstNonEmpty(next.UserID, existing.UserID)
+	next.UserID = preferredPlaybackUserID(next.UserID, existing.UserID)
 	next.ItemID = firstNonEmpty(next.ItemID, existing.ItemID)
 	next.MediaSourceID = firstNonEmpty(next.MediaSourceID, existing.MediaSourceID)
 	next.PlaySessionID = firstNonEmpty(next.PlaySessionID, existing.PlaySessionID)
@@ -524,7 +772,52 @@ func mergePlaybackState(existing, next playbackSessionState) playbackSessionStat
 	if existing.MaxPositionTicks > next.MaxPositionTicks {
 		next.MaxPositionTicks = existing.MaxPositionTicks
 	}
+	if next.StartedAt.IsZero() || (!existing.StartedAt.IsZero() && existing.StartedAt.Before(next.StartedAt)) {
+		next.StartedAt = existing.StartedAt
+	}
+	if !next.HasInitialPlayed && existing.HasInitialPlayed {
+		next.InitialPlayed = existing.InitialPlayed
+		next.HasInitialPlayed = true
+	}
+	if !next.HasInitialPosition && existing.HasInitialPosition {
+		next.InitialPositionTicks = existing.InitialPositionTicks
+		next.HasInitialPosition = true
+	}
+	if !next.FreshStartCleared && existing.FreshStartCleared {
+		next.FreshStartCleared = true
+		next.FreshStartResumeTicks = existing.FreshStartResumeTicks
+		next.FreshStartClearedAt = existing.FreshStartClearedAt
+	}
 	return next
+}
+
+func preferredPlaybackUserID(checkinUserID, trustedUserID string) string {
+	checkinUserID = strings.TrimSpace(checkinUserID)
+	trustedUserID = strings.TrimSpace(trustedUserID)
+	if trustedUserID == "" {
+		return checkinUserID
+	}
+	if checkinUserID == "" || strings.EqualFold(checkinUserID, trustedUserID) {
+		return trustedUserID
+	}
+	if looksLikeEmbyUserID(trustedUserID) && !looksLikeEmbyUserID(checkinUserID) {
+		return trustedUserID
+	}
+	return checkinUserID
+}
+
+func looksLikeEmbyUserID(value string) bool {
+	value = strings.TrimSpace(value)
+	if len(value) != 32 {
+		return false
+	}
+	for _, r := range value {
+		if (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F') {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func playbackSessionKeys(userID, itemID, playSessionID string) []string {
@@ -580,48 +873,542 @@ func (p *Proxy) correctStoppedPlayback(settings models.P115Settings, r *http.Req
 		return
 	}
 	decision := playbackCorrection(checkin, state)
+	itemID := firstNonEmpty(checkin.ItemID, state.ItemID)
+	userIDs := playbackCorrectionUserIDs(checkin, state)
 	if decision.Action == playbackCorrectionNone {
+		if decision.Reason == "position reached watched threshold" && len(userIDs) > 0 && itemID != "" {
+			ctx, cancel := context.WithTimeout(context.Background(), embyCorrectionTimeout)
+			for _, userID := range userIDs {
+				p.clearPlaybackProgressLedger(ctx, userID, itemID, "watched_threshold")
+			}
+			cancel()
+		}
 		playdiag.Printf("curio emby playback correction skipped item=%q user=%q session=%q link=%s reason=%q position_ticks=%d duration_ticks=%d path=%q request_ua=%q",
 			checkin.ItemID, checkin.UserID, checkin.PlaySessionID, shortProxyLogValue(checkin.LinkID, 16), decision.Reason, decision.PositionTicks, decision.RunTimeTicks, checkin.OriginalPath, checkin.OriginalUserAgent)
 		return
 	}
-	userID := firstNonEmpty(checkin.UserID, state.UserID)
-	itemID := firstNonEmpty(checkin.ItemID, state.ItemID)
-	if userID == "" || itemID == "" {
+	if len(userIDs) == 0 || itemID == "" {
 		playdiag.Printf("curio emby playback correction skipped item=%q user=%q session=%q link=%s action=%s reason=%q path=%q request_ua=%q",
-			itemID, userID, checkin.PlaySessionID, shortProxyLogValue(checkin.LinkID, 16), decision.Action, "missing user or item", checkin.OriginalPath, checkin.OriginalUserAgent)
+			itemID, firstNonEmpty(checkin.UserID, state.UserID), checkin.PlaySessionID, shortProxyLogValue(checkin.LinkID, 16), decision.Action, "missing user or item", checkin.OriginalPath, checkin.OriginalUserAgent)
+		return
+	}
+	if p.playbackManuallyCleared(userIDs, itemID, state, time.Now()) {
+		playdiag.Printf("curio emby playback correction skipped item=%q users=%q session=%q link=%s reason=%q position_ticks=%d path=%q request_ua=%q",
+			itemID, strings.Join(userIDs, ","), checkin.PlaySessionID, shortProxyLogValue(checkin.LinkID, 16), "manual clear is newer than playback session", decision.PositionTicks, checkin.OriginalPath, checkin.OriginalUserAgent)
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), embyCorrectionTimeout)
 	defer cancel()
-	if err := p.embyMarkUnplayed(ctx, settings, r, userID, itemID); err != nil {
-		playdiag.Printf("curio emby playback correction failed action=%s item=%q user=%q session=%q link=%s position_ticks=%d duration_ticks=%d err=%s path=%q request_ua=%q",
-			decision.Action, itemID, userID, checkin.PlaySessionID, shortProxyLogValue(checkin.LinkID, 16), decision.PositionTicks, decision.RunTimeTicks, err.Error(), checkin.OriginalPath, checkin.OriginalUserAgent)
+	var lastErr error
+	for _, userID := range userIDs {
+		if err := p.embyMarkUnplayed(ctx, settings, r, userID, itemID); err != nil {
+			lastErr = err
+			continue
+		}
+		if decision.Action == playbackCorrectionClearWatched {
+			if err := p.embyClearResume(ctx, settings, r, userID, itemID); err != nil {
+				lastErr = err
+				continue
+			}
+			p.clearPlaybackProgressLedger(ctx, userID, itemID, decision.Reason)
+		}
+		if decision.Action == playbackCorrectionSaveResume {
+			if err := p.embySaveResume(ctx, settings, r, userID, itemID, decision.PositionTicks); err != nil {
+				lastErr = err
+				continue
+			}
+			p.markPlaybackProgressSaved(userID, itemID, decision.PositionTicks, time.Now())
+			p.recordPlaybackProgressLedger(ctx, userID, itemID, checkin, state, decision)
+		}
+		playdiag.Printf("curio emby playback correction ok action=%s item=%q user=%q session=%q link=%s position_ticks=%d duration_ticks=%d reason=%q path=%q request_ua=%q",
+			decision.Action, itemID, userID, checkin.PlaySessionID, shortProxyLogValue(checkin.LinkID, 16), decision.PositionTicks, decision.RunTimeTicks, decision.Reason, checkin.OriginalPath, checkin.OriginalUserAgent)
 		return
 	}
-	if decision.Action == playbackCorrectionSaveResume {
+	if lastErr != nil {
+		playdiag.Printf("curio emby playback correction failed action=%s item=%q users=%q session=%q link=%s position_ticks=%d duration_ticks=%d err=%s path=%q request_ua=%q",
+			decision.Action, itemID, strings.Join(userIDs, ","), checkin.PlaySessionID, shortProxyLogValue(checkin.LinkID, 16), decision.PositionTicks, decision.RunTimeTicks, lastErr.Error(), checkin.OriginalPath, checkin.OriginalUserAgent)
+	}
+}
+
+func (p *Proxy) protectEarlyPlayback(settings models.P115Settings, r *http.Request, checkin playbackCheckin, state playbackSessionState, upstreamStatus int) {
+	if upstreamStatus < http.StatusOK || upstreamStatus >= http.StatusBadRequest {
+		return
+	}
+	if state.HasInitialPlayed && state.InitialPlayed {
+		return
+	}
+	position := playbackProgressSavePosition(checkin, state)
+	if position >= playbackResumeTicks || state.MaxPositionTicks >= playbackResumeTicks {
+		return
+	}
+	itemID := firstNonEmpty(checkin.ItemID, state.ItemID)
+	userIDs := playbackCorrectionUserIDs(checkin, state)
+	if len(userIDs) == 0 || itemID == "" {
+		return
+	}
+	if !p.markPlaybackProtected(userIDs[0], itemID, time.Now()) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), embyCorrectionTimeout)
+	defer cancel()
+	var lastErr error
+	for _, userID := range userIDs {
+		if err := p.embyMarkUnplayed(ctx, settings, r, userID, itemID); err != nil {
+			lastErr = err
+			continue
+		}
+		playdiag.Printf("curio emby playback early protect ok item=%q user=%q session=%q link=%s position_ticks=%d path=%q request_ua=%q",
+			itemID, userID, checkin.PlaySessionID, shortProxyLogValue(checkin.LinkID, 16), position, checkin.OriginalPath, checkin.OriginalUserAgent)
+		return
+	}
+	if lastErr != nil {
+		playdiag.Printf("curio emby playback early protect failed item=%q users=%q session=%q link=%s position_ticks=%d err=%s path=%q request_ua=%q",
+			itemID, strings.Join(userIDs, ","), checkin.PlaySessionID, shortProxyLogValue(checkin.LinkID, 16), position, lastErr.Error(), checkin.OriginalPath, checkin.OriginalUserAgent)
+	}
+}
+
+func (p *Proxy) clearResumeOnFreshStart(settings models.P115Settings, r *http.Request, checkin playbackCheckin, state playbackSessionState, upstreamStatus int) {
+	if upstreamStatus < http.StatusOK || upstreamStatus >= http.StatusBadRequest {
+		return
+	}
+	if !playbackStartedFromBeginning(checkin, state) {
+		return
+	}
+	itemID := firstNonEmpty(checkin.ItemID, state.ItemID)
+	userIDs := playbackCorrectionUserIDs(checkin, state)
+	if len(userIDs) == 0 || itemID == "" {
+		return
+	}
+	resumeTicks := state.InitialPositionTicks
+	ctx, cancel := context.WithTimeout(context.Background(), embyCorrectionTimeout)
+	defer cancel()
+	var lastErr error
+	for _, userID := range userIDs {
+		if err := p.embyClearResume(ctx, settings, r, userID, itemID); err != nil {
+			lastErr = err
+			continue
+		}
+		p.clearPlaybackProgressLedger(ctx, userID, itemID, "fresh_start")
+		p.markPlaybackFreshStartReset(userID, itemID, checkin.PlaySessionID, resumeTicks, time.Now())
+		playdiag.Printf("curio emby playback fresh-start clear ok item=%q user=%q session=%q link=%s resume_ticks=%d path=%q request_ua=%q",
+			itemID, userID, checkin.PlaySessionID, shortProxyLogValue(checkin.LinkID, 16), resumeTicks, checkin.OriginalPath, checkin.OriginalUserAgent)
+		return
+	}
+	if lastErr != nil {
+		playdiag.Printf("curio emby playback fresh-start clear failed item=%q users=%q session=%q link=%s resume_ticks=%d err=%s path=%q request_ua=%q",
+			itemID, strings.Join(userIDs, ","), checkin.PlaySessionID, shortProxyLogValue(checkin.LinkID, 16), resumeTicks, lastErr.Error(), checkin.OriginalPath, checkin.OriginalUserAgent)
+	}
+}
+
+func (p *Proxy) savePlaybackProgress(settings models.P115Settings, r *http.Request, checkin playbackCheckin, state playbackSessionState, upstreamStatus int) {
+	if upstreamStatus < http.StatusOK || upstreamStatus >= http.StatusBadRequest {
+		playdiag.Printf("curio emby playback progress save skipped item=%q user=%q session=%q link=%s reason=%q upstream_status=%d path=%q request_ua=%q",
+			checkin.ItemID, checkin.UserID, checkin.PlaySessionID, shortProxyLogValue(checkin.LinkID, 16), "upstream did not accept checkin", upstreamStatus, checkin.OriginalPath, checkin.OriginalUserAgent)
+		return
+	}
+	if p.clearStaleFreshStartProgress(settings, r, checkin, state) {
+		return
+	}
+	decision := playbackProgressSaveDecision(checkin, state)
+	if decision.Action == playbackCorrectionNone {
+		if decision.Reason != "throttled" {
+			playdiag.Printf("curio emby playback progress save skipped item=%q user=%q session=%q link=%s reason=%q position_ticks=%d duration_ticks=%d path=%q request_ua=%q",
+				checkin.ItemID, checkin.UserID, checkin.PlaySessionID, shortProxyLogValue(checkin.LinkID, 16), decision.Reason, decision.PositionTicks, decision.RunTimeTicks, checkin.OriginalPath, checkin.OriginalUserAgent)
+		}
+		return
+	}
+	itemID := firstNonEmpty(checkin.ItemID, state.ItemID)
+	userIDs := playbackCorrectionUserIDs(checkin, state)
+	if len(userIDs) == 0 || itemID == "" {
+		playdiag.Printf("curio emby playback progress save skipped item=%q user=%q session=%q link=%s reason=%q path=%q request_ua=%q",
+			itemID, firstNonEmpty(checkin.UserID, state.UserID), checkin.PlaySessionID, shortProxyLogValue(checkin.LinkID, 16), "missing user or item", checkin.OriginalPath, checkin.OriginalUserAgent)
+		return
+	}
+	if p.playbackManuallyCleared(userIDs, itemID, state, time.Now()) {
+		playdiag.Printf("curio emby playback progress save skipped item=%q users=%q session=%q link=%s reason=%q position_ticks=%d path=%q request_ua=%q",
+			itemID, strings.Join(userIDs, ","), checkin.PlaySessionID, shortProxyLogValue(checkin.LinkID, 16), "manual clear is newer than playback session", decision.PositionTicks, checkin.OriginalPath, checkin.OriginalUserAgent)
+		return
+	}
+	if !p.markPlaybackProgressSaved(userIDs[0], itemID, decision.PositionTicks, time.Now()) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), embyCorrectionTimeout)
+	defer cancel()
+	var lastErr error
+	for _, userID := range userIDs {
 		if err := p.embySaveResume(ctx, settings, r, userID, itemID, decision.PositionTicks); err != nil {
-			playdiag.Printf("curio emby playback correction failed action=%s item=%q user=%q session=%q link=%s position_ticks=%d duration_ticks=%d err=%s path=%q request_ua=%q",
-				decision.Action, itemID, userID, checkin.PlaySessionID, shortProxyLogValue(checkin.LinkID, 16), decision.PositionTicks, decision.RunTimeTicks, err.Error(), checkin.OriginalPath, checkin.OriginalUserAgent)
-			return
+			lastErr = err
+			continue
+		}
+		p.recordPlaybackProgressLedger(ctx, userID, itemID, checkin, state, decision)
+		playdiag.Printf("curio emby playback progress save ok item=%q user=%q session=%q link=%s position_ticks=%d duration_ticks=%d reason=%q path=%q request_ua=%q",
+			itemID, userID, checkin.PlaySessionID, shortProxyLogValue(checkin.LinkID, 16), decision.PositionTicks, decision.RunTimeTicks, decision.Reason, checkin.OriginalPath, checkin.OriginalUserAgent)
+		return
+	}
+	if lastErr != nil {
+		playdiag.Printf("curio emby playback progress save failed item=%q users=%q session=%q link=%s position_ticks=%d duration_ticks=%d err=%s path=%q request_ua=%q",
+			itemID, strings.Join(userIDs, ","), checkin.PlaySessionID, shortProxyLogValue(checkin.LinkID, 16), decision.PositionTicks, decision.RunTimeTicks, lastErr.Error(), checkin.OriginalPath, checkin.OriginalUserAgent)
+	}
+}
+
+func (p *Proxy) clearStaleFreshStartProgress(settings models.P115Settings, r *http.Request, checkin playbackCheckin, state playbackSessionState) bool {
+	position := playbackProgressSavePosition(checkin, state)
+	if !playbackPositionLooksLikeFreshStartStaleResume(position, state) {
+		return false
+	}
+	itemID := firstNonEmpty(checkin.ItemID, state.ItemID)
+	userIDs := playbackCorrectionUserIDs(checkin, state)
+	if len(userIDs) == 0 || itemID == "" {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), embyCorrectionTimeout)
+	defer cancel()
+	var lastErr error
+	for _, userID := range userIDs {
+		if err := p.embyClearResume(ctx, settings, r, userID, itemID); err != nil {
+			lastErr = err
+			continue
+		}
+		p.clearPlaybackProgressLedger(ctx, userID, itemID, "fresh_start_stale_progress")
+		playdiag.Printf("curio emby playback progress stale fresh-start cleared item=%q user=%q session=%q link=%s position_ticks=%d resume_ticks=%d path=%q request_ua=%q",
+			itemID, userID, checkin.PlaySessionID, shortProxyLogValue(checkin.LinkID, 16), position, state.FreshStartResumeTicks, checkin.OriginalPath, checkin.OriginalUserAgent)
+		return true
+	}
+	if lastErr != nil {
+		playdiag.Printf("curio emby playback progress stale fresh-start clear failed item=%q users=%q session=%q link=%s position_ticks=%d resume_ticks=%d err=%s path=%q request_ua=%q",
+			itemID, strings.Join(userIDs, ","), checkin.PlaySessionID, shortProxyLogValue(checkin.LinkID, 16), position, state.FreshStartResumeTicks, lastErr.Error(), checkin.OriginalPath, checkin.OriginalUserAgent)
+	}
+	return true
+}
+
+func (p *Proxy) recordPlaybackProgressLedger(ctx context.Context, userID, itemID string, checkin playbackCheckin, state playbackSessionState, decision playbackCorrectionDecision) {
+	if p == nil || p.store == nil || decision.Action != playbackCorrectionSaveResume {
+		return
+	}
+	userID = strings.TrimSpace(userID)
+	itemID = strings.TrimSpace(itemID)
+	if userID == "" || itemID == "" || decision.PositionTicks < playbackResumeTicks {
+		return
+	}
+	progress := models.EmbyPlaybackProgress{
+		ID:            stablePlaybackProgressID("default", userID, itemID),
+		EmbyServerID:  "default",
+		UserID:        userID,
+		EmbyItemID:    itemID,
+		STRMLinkID:    firstNonEmpty(checkin.LinkID, state.LinkID),
+		PositionTicks: decision.PositionTicks,
+		DurationTicks: firstPositiveI64(decision.RunTimeTicks, state.RunTimeTicks, checkin.RunTimeTicks),
+		Played:        false,
+		Client:        checkin.OriginalUserAgent,
+		PlaySessionID: firstNonEmpty(checkin.PlaySessionID, state.PlaySessionID),
+		LastEvent:     string(checkin.Kind),
+	}
+	if err := p.store.UpsertEmbyPlaybackProgress(ctx, progress); err != nil {
+		playdiag.Printf("curio emby playback ledger save failed item=%q user=%q session=%q link=%s position_ticks=%d duration_ticks=%d err=%s",
+			itemID, userID, progress.PlaySessionID, shortProxyLogValue(progress.STRMLinkID, 16), progress.PositionTicks, progress.DurationTicks, err.Error())
+		return
+	}
+	playdiag.Printf("curio emby playback ledger save ok item=%q user=%q session=%q link=%s position_ticks=%d duration_ticks=%d",
+		itemID, userID, progress.PlaySessionID, shortProxyLogValue(progress.STRMLinkID, 16), progress.PositionTicks, progress.DurationTicks)
+}
+
+func (p *Proxy) clearPlaybackProgressLedger(ctx context.Context, userID, itemID, event string) {
+	if p == nil || p.store == nil {
+		return
+	}
+	userID = strings.TrimSpace(userID)
+	itemID = strings.TrimSpace(itemID)
+	if userID == "" || itemID == "" {
+		return
+	}
+	if err := p.store.ClearEmbyPlaybackProgress(ctx, "default", userID, itemID, event); err != nil {
+		playdiag.Printf("curio emby playback ledger clear failed item=%q user=%q event=%q err=%s", itemID, userID, event, err.Error())
+		return
+	}
+	playdiag.Printf("curio emby playback ledger clear ok item=%q user=%q event=%q", itemID, userID, event)
+}
+
+func playbackCorrectionUserIDs(checkin playbackCheckin, state playbackSessionState) []string {
+	candidates := []string{
+		state.UserID,
+		preferredPlaybackUserID(checkin.UserID, state.UserID),
+		checkin.UserID,
+	}
+	out := make([]string, 0, len(candidates))
+	seen := map[string]struct{}{}
+	for _, candidate := range candidates {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		key := strings.ToLower(candidate)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, candidate)
+	}
+	return out
+}
+
+func playbackProgressSaveDecision(checkin playbackCheckin, state playbackSessionState) playbackCorrectionDecision {
+	if checkin.Kind != playbackCheckinProgress {
+		return playbackCorrectionDecision{Action: playbackCorrectionNone, Reason: "not progress checkin"}
+	}
+	position := playbackProgressSavePosition(checkin, state)
+	duration := firstPositiveI64(state.RunTimeTicks, checkin.RunTimeTicks)
+	if playbackPositionLooksLikeFreshStartStaleResume(position, state) {
+		return playbackCorrectionDecision{Action: playbackCorrectionNone, PositionTicks: position, RunTimeTicks: duration, Reason: "fresh start stale resume position"}
+	}
+	if position <= 0 {
+		return playbackCorrectionDecision{Action: playbackCorrectionNone, PositionTicks: position, RunTimeTicks: duration, Reason: "invalid progress position"}
+	}
+	if position < playbackResumeTicks {
+		return playbackCorrectionDecision{Action: playbackCorrectionNone, PositionTicks: position, RunTimeTicks: duration, Reason: "position below resume threshold"}
+	}
+	if duration > 0 && position*100 >= duration*90 {
+		return playbackCorrectionDecision{Action: playbackCorrectionNone, PositionTicks: position, RunTimeTicks: duration, Reason: "position reached watched threshold"}
+	}
+	return playbackCorrectionDecision{Action: playbackCorrectionSaveResume, PositionTicks: position, RunTimeTicks: duration, Reason: "progress checkin"}
+}
+
+func playbackProgressSavePosition(checkin playbackCheckin, state playbackSessionState) int64 {
+	if checkin.HasPositionTicks && checkin.PositionTicks > 0 {
+		return checkin.PositionTicks
+	}
+	return state.LastPositionTicks
+}
+
+func playbackStartedFromBeginning(checkin playbackCheckin, state playbackSessionState) bool {
+	if checkin.Kind != playbackCheckinPlaying || !checkin.HasPositionTicks || checkin.PositionTicks > 0 {
+		return false
+	}
+	if state.FreshStartCleared || state.InitialPlayed {
+		return false
+	}
+	return state.HasInitialPosition && state.InitialPositionTicks >= playbackResumeTicks
+}
+
+func playbackPositionLooksLikeFreshStartStaleResume(position int64, state playbackSessionState) bool {
+	if !state.FreshStartCleared || state.FreshStartResumeTicks < playbackResumeTicks || position <= 0 {
+		return false
+	}
+	return position+playbackPositionSlack >= state.FreshStartResumeTicks
+}
+
+func (p *Proxy) markPlaybackProgressSaved(userID, itemID string, positionTicks int64, now time.Time) bool {
+	if p == nil {
+		return true
+	}
+	key := playbackProgressSaveKey(userID, itemID)
+	if key == "" {
+		return true
+	}
+	p.progressSaveMu.Lock()
+	defer p.progressSaveMu.Unlock()
+	if p.progressSaves == nil {
+		p.progressSaves = map[string]playbackProgressSaveState{}
+	}
+	cleanupPlaybackProgressSavesLocked(p.progressSaves, now)
+	if existing, ok := p.progressSaves[key]; ok {
+		delta := positionTicks - existing.PositionTicks
+		if delta < 0 {
+			delta = -delta
+		}
+		if now.Sub(existing.SavedAt) < progressSaveInterval && delta < progressSaveMinDelta {
+			return false
 		}
 	}
-	playdiag.Printf("curio emby playback correction ok action=%s item=%q user=%q session=%q link=%s position_ticks=%d duration_ticks=%d reason=%q path=%q request_ua=%q",
-		decision.Action, itemID, userID, checkin.PlaySessionID, shortProxyLogValue(checkin.LinkID, 16), decision.PositionTicks, decision.RunTimeTicks, decision.Reason, checkin.OriginalPath, checkin.OriginalUserAgent)
+	p.progressSaves[key] = playbackProgressSaveState{SavedAt: now, PositionTicks: positionTicks}
+	return true
+}
+
+func playbackProgressSaveKey(userID, itemID string) string {
+	userID = strings.ToLower(strings.TrimSpace(userID))
+	itemID = strings.TrimSpace(itemID)
+	if userID == "" || itemID == "" {
+		return ""
+	}
+	return userID + "\x00" + itemID
+}
+
+func cleanupPlaybackProgressSavesLocked(saves map[string]playbackProgressSaveState, now time.Time) {
+	for key, state := range saves {
+		if now.Sub(state.SavedAt) > playbackStateTTL {
+			delete(saves, key)
+		}
+	}
+}
+
+func (p *Proxy) rememberManualPlaybackClear(userID, itemID string, now time.Time) {
+	if p == nil {
+		return
+	}
+	key := playbackProgressSaveKey(userID, itemID)
+	if key == "" {
+		return
+	}
+	p.progressSaveMu.Lock()
+	if p.progressSaves != nil {
+		delete(p.progressSaves, key)
+	}
+	p.progressSaveMu.Unlock()
+
+	p.protectMu.Lock()
+	if p.protectRecent != nil {
+		delete(p.protectRecent, key)
+	}
+	p.protectMu.Unlock()
+
+	p.manualClearMu.Lock()
+	defer p.manualClearMu.Unlock()
+	if p.manualClears == nil {
+		p.manualClears = map[string]time.Time{}
+	}
+	cleanupManualClearsLocked(p.manualClears, now)
+	p.manualClears[key] = now
+}
+
+func (p *Proxy) markPlaybackFreshStartReset(userID, itemID, playSessionID string, resumeTicks int64, now time.Time) {
+	if p == nil || strings.TrimSpace(itemID) == "" {
+		return
+	}
+	p.playbackMu.Lock()
+	defer p.playbackMu.Unlock()
+	if p.playbackSessions == nil {
+		p.playbackSessions = map[string]playbackSessionState{}
+	}
+	cleanupPlaybackSessionsLocked(p.playbackSessions, now)
+	state := playbackSessionState{
+		UserID:                userID,
+		ItemID:                itemID,
+		PlaySessionID:         playSessionID,
+		FreshStartCleared:     true,
+		FreshStartResumeTicks: resumeTicks,
+		FreshStartClearedAt:   now,
+		UpdatedAt:             now,
+	}
+	for _, key := range playbackSessionKeys(userID, itemID, playSessionID) {
+		if existing, ok := p.playbackSessions[key]; ok {
+			state = mergePlaybackState(existing, state)
+			state.FreshStartCleared = true
+			state.FreshStartResumeTicks = resumeTicks
+			state.FreshStartClearedAt = now
+			break
+		}
+	}
+	for _, key := range playbackSessionKeys(state.UserID, state.ItemID, state.PlaySessionID) {
+		if key == "" {
+			continue
+		}
+		p.playbackSessions[key] = state
+	}
+}
+
+func (p *Proxy) playbackManuallyCleared(userIDs []string, itemID string, state playbackSessionState, now time.Time) bool {
+	if p == nil || itemID == "" {
+		return false
+	}
+	p.manualClearMu.Lock()
+	defer p.manualClearMu.Unlock()
+	if len(p.manualClears) == 0 {
+		return false
+	}
+	cleanupManualClearsLocked(p.manualClears, now)
+	for _, userID := range userIDs {
+		key := playbackProgressSaveKey(userID, itemID)
+		if key == "" {
+			continue
+		}
+		clearAt, ok := p.manualClears[key]
+		if !ok {
+			continue
+		}
+		if state.StartedAt.IsZero() {
+			return now.Sub(clearAt) <= manualClearTTL
+		}
+		if !state.StartedAt.After(clearAt) {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *Proxy) playbackStateWasManuallyClearedLocked(state playbackSessionState, userID, itemID string, now time.Time) bool {
+	if p == nil || itemID == "" {
+		return false
+	}
+	p.manualClearMu.Lock()
+	defer p.manualClearMu.Unlock()
+	if len(p.manualClears) == 0 {
+		return false
+	}
+	cleanupManualClearsLocked(p.manualClears, now)
+	for _, candidate := range []string{userID, state.UserID} {
+		key := playbackProgressSaveKey(candidate, itemID)
+		if key == "" {
+			continue
+		}
+		clearAt, ok := p.manualClears[key]
+		if !ok {
+			continue
+		}
+		if state.StartedAt.IsZero() || !state.StartedAt.After(clearAt) {
+			return true
+		}
+	}
+	return false
+}
+
+func cleanupManualClearsLocked(clears map[string]time.Time, now time.Time) {
+	for key, clearedAt := range clears {
+		if now.Sub(clearedAt) > manualClearTTL {
+			delete(clears, key)
+		}
+	}
+}
+
+func (p *Proxy) markPlaybackProtected(userID, itemID string, now time.Time) bool {
+	if p == nil {
+		return true
+	}
+	key := playbackProgressSaveKey(userID, itemID)
+	if key == "" {
+		return true
+	}
+	p.protectMu.Lock()
+	defer p.protectMu.Unlock()
+	if p.protectRecent == nil {
+		p.protectRecent = map[string]time.Time{}
+	}
+	for existingKey, protectedAt := range p.protectRecent {
+		if now.Sub(protectedAt) > playbackStateTTL {
+			delete(p.protectRecent, existingKey)
+		}
+	}
+	if protectedAt, ok := p.protectRecent[key]; ok && now.Sub(protectedAt) < playbackProtectInterval {
+		return false
+	}
+	p.protectRecent[key] = now
+	return true
 }
 
 func playbackCorrection(checkin playbackCheckin, state playbackSessionState) playbackCorrectionDecision {
 	position := int64(0)
 	if checkin.HasPositionTicks && checkin.PositionTicks > 0 {
 		position = checkin.PositionTicks
-	}
-	if state.LastPositionTicks > position {
-		position = state.LastPositionTicks
-	}
-	if state.MaxPositionTicks > position {
-		position = state.MaxPositionTicks
+	} else {
+		if state.LastPositionTicks > position {
+			position = state.LastPositionTicks
+		}
+		if state.MaxPositionTicks > position {
+			position = state.MaxPositionTicks
+		}
 	}
 	duration := firstPositiveI64(state.RunTimeTicks, checkin.RunTimeTicks)
+	if playbackPositionLooksLikeFreshStartStaleResume(position, state) {
+		return playbackCorrectionDecision{Action: playbackCorrectionClearWatched, PositionTicks: position, RunTimeTicks: duration, Reason: "fresh start stale resume position"}
+	}
 	if position <= 0 {
 		return playbackCorrectionDecision{Action: playbackCorrectionClearWatched, PositionTicks: position, RunTimeTicks: duration, Reason: "invalid or empty stop position"}
 	}
@@ -659,6 +1446,40 @@ func (p *Proxy) embySaveResume(ctx context.Context, settings models.P115Settings
 	payload["Played"] = false
 	_, _, err := p.doEmbyRequest(ctx, settings, r, http.MethodPost, apiPath, payload)
 	return err
+}
+
+func (p *Proxy) embyClearResume(ctx context.Context, settings models.P115Settings, r *http.Request, userID, itemID string) error {
+	apiPath := "/Users/" + url.PathEscape(userID) + "/Items/" + url.PathEscape(itemID) + "/UserData"
+	payload := map[string]any{}
+	if body, _, err := p.doEmbyRequest(ctx, settings, r, http.MethodGet, apiPath, nil); err == nil && len(body) > 0 {
+		_ = json.Unmarshal(body, &payload)
+	}
+	payload["PlaybackPositionTicks"] = int64(0)
+	payload["Played"] = false
+	_, _, err := p.doEmbyRequest(ctx, settings, r, http.MethodPost, apiPath, payload)
+	return err
+}
+
+func (p *Proxy) embyItemUserData(ctx context.Context, settings models.P115Settings, r *http.Request, userID, itemID string) (embyPlaybackUserData, error) {
+	apiPath := "/Users/" + url.PathEscape(userID) + "/Items/" + url.PathEscape(itemID)
+	body, _, err := p.doEmbyRequest(ctx, settings, r, http.MethodGet, apiPath, nil)
+	if err != nil {
+		return embyPlaybackUserData{}, err
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return embyPlaybackUserData{}, err
+	}
+	userData, _ := payload["UserData"].(map[string]any)
+	out := embyPlaybackUserData{}
+	if position, ok := int64FromAny(userData["PlaybackPositionTicks"]); ok {
+		out.PlaybackPositionTicks = position
+	}
+	if played, ok := boolFromAny(userData["Played"]); ok {
+		out.Played = played
+		out.HasPlayed = true
+	}
+	return out, nil
 }
 
 func (p *Proxy) resolveEmbyUserIDFromSessions(ctx context.Context, settings models.P115Settings, r *http.Request, checkin playbackCheckin) string {
@@ -743,9 +1564,14 @@ func embyAPIURL(settings models.P115Settings, apiPath string) (*url.URL, error) 
 	if upstream.Scheme == "" || upstream.Host == "" {
 		return nil, errors.New("invalid Emby upstream URL")
 	}
+	apiQuery := ""
+	if cut := strings.Index(apiPath, "?"); cut >= 0 {
+		apiQuery = apiPath[cut+1:]
+		apiPath = apiPath[:cut]
+	}
 	next := *upstream
 	next.Path = joinURLPath(upstream.Path, apiPath)
-	next.RawQuery = ""
+	next.RawQuery = apiQuery
 	return &next, nil
 }
 
@@ -793,8 +1619,14 @@ func (p *Proxy) reverseProxy(settings models.P115Settings) http.Handler {
 		if isPlaybackInfo(reqPath) {
 			return p.rewritePlaybackInfo(resp, settings)
 		}
+		if shouldRewriteResumeItems(reqPath, resp) {
+			return p.rewriteResumeItems(resp, settings)
+		}
 		if shouldRewriteItemMediaSources(reqPath, resp) {
 			return p.rewriteItemMediaSources(resp, reqPath)
+		}
+		if shouldNoStorePlaybackResponse(reqPath, resp) {
+			setNoStoreHeaders(resp.Header)
 		}
 		return nil
 	}
@@ -812,6 +1644,421 @@ func shouldRewriteItemMediaSources(raw string, resp *http.Response) bool {
 	return contentType == "" || strings.Contains(contentType, "json")
 }
 
+func shouldRewriteResumeItems(raw string, resp *http.Response) bool {
+	if resp == nil || resp.Request == nil {
+		return false
+	}
+	if resp.StatusCode != http.StatusOK || !resumeItemsPattern.MatchString(strings.TrimLeft(raw, "/")) {
+		return false
+	}
+	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
+	return contentType == "" || strings.Contains(contentType, "json")
+}
+
+func shouldNoStorePlaybackResponse(raw string, resp *http.Response) bool {
+	if resp == nil || resp.StatusCode != http.StatusOK {
+		return false
+	}
+	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
+	if contentType != "" && !strings.Contains(contentType, "json") {
+		return false
+	}
+	cleaned := strings.ToLower(strings.Trim(strings.TrimLeft(raw, "/"), "/"))
+	return strings.HasSuffix(cleaned, "/items/resume") || cleaned == "shows/nextup" || strings.HasSuffix(cleaned, "/userdata")
+}
+
+func (p *Proxy) rewriteResumeItems(resp *http.Response, settings models.P115Settings) error {
+	started := time.Now()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+	if err != nil {
+		return err
+	}
+	_ = resp.Body.Close()
+	var payload map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	if err := decoder.Decode(&payload); err != nil {
+		resp.Body = io.NopCloser(bytes.NewReader(body))
+		setNoStoreHeaders(resp.Header)
+		return nil
+	}
+	filtered, removed := filterInvalidResumeItems(payload)
+	ledgerChanged, ledgerAdded, ledgerUpdated := p.mergePlaybackLedgerResumeItems(resp.Request.Context(), settings, resp.Request, payload)
+	changedMedia := p.rewriteMediaSourcesInValue(resp.Request.Context(), resp.Request, payload, "", true, false)
+	if !filtered && !ledgerChanged && !changedMedia {
+		resp.Body = io.NopCloser(bytes.NewReader(body))
+		setNoStoreHeaders(resp.Header)
+		return nil
+	}
+	playdiag.Printf("curio emby resume items sanitized removed=%d ledger_added=%d ledger_updated=%d media_changed=%t path=%q request_ua=%q elapsed_ms=%d",
+		removed, ledgerAdded, ledgerUpdated, changedMedia, resp.Request.URL.RequestURI(), resp.Request.UserAgent(), time.Since(started).Milliseconds())
+	next, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	setRewrittenJSONResponse(resp, next)
+	return nil
+}
+
+func filterInvalidResumeItems(payload map[string]any) (bool, int) {
+	items, ok := payload["Items"].([]any)
+	if !ok {
+		return false, 0
+	}
+	out := make([]any, 0, len(items))
+	removed := 0
+	for _, raw := range items {
+		item, ok := raw.(map[string]any)
+		if ok && !resumeItemHasMeaningfulProgress(item) {
+			removed++
+			continue
+		}
+		out = append(out, raw)
+	}
+	if removed == 0 {
+		return false, 0
+	}
+	payload["Items"] = out
+	if total, ok := int64FromAny(payload["TotalRecordCount"]); ok {
+		nextTotal := total - int64(removed)
+		if nextTotal < int64(len(out)) {
+			nextTotal = int64(len(out))
+		}
+		if nextTotal < 0 {
+			nextTotal = 0
+		}
+		payload["TotalRecordCount"] = nextTotal
+	}
+	return true, removed
+}
+
+func resumeItemHasMeaningfulProgress(item map[string]any) bool {
+	userData, _ := item["UserData"].(map[string]any)
+	if played, ok := boolFromAny(userData["Played"]); ok && played {
+		return false
+	}
+	position, ok := int64FromAny(userData["PlaybackPositionTicks"])
+	return ok && position >= playbackResumeTicks
+}
+
+func (p *Proxy) mergePlaybackLedgerResumeItems(ctx context.Context, settings models.P115Settings, r *http.Request, payload map[string]any) (bool, int, int) {
+	if p == nil || p.store == nil || payload == nil || r == nil || !resumeRequestAllowsVideo(r) || resumeRequestStartIndex(r) > 0 {
+		return false, 0, 0
+	}
+	userID := playbackRequestUserID(r)
+	if userID == "" {
+		return false, 0, 0
+	}
+	progresses, err := p.store.RecentEmbyPlaybackProgress(ctx, "default", userID, resumeLedgerFetchLimit(r))
+	if err != nil {
+		playdiag.Printf("curio emby resume ledger query failed user=%q path=%q request_ua=%q err=%s", userID, r.URL.RequestURI(), r.UserAgent(), err.Error())
+		return false, 0, 0
+	}
+	if len(progresses) == 0 {
+		return false, 0, 0
+	}
+	progresses = p.filterActivePlaybackProgress(progresses, userID, time.Now())
+	if len(progresses) == 0 {
+		return false, 0, 0
+	}
+	missingIDs := missingResumeProgressItemIDs(payload, progresses)
+	details := map[string]map[string]any{}
+	if len(missingIDs) > 0 {
+		fetchCtx, cancel := context.WithTimeout(context.Background(), embyUserDataTimeout)
+		var fetchErr error
+		details, fetchErr = p.embyItemsByIDs(fetchCtx, settings, r, userID, missingIDs)
+		cancel()
+		if fetchErr != nil {
+			playdiag.Printf("curio emby resume ledger detail fetch failed user=%q ids=%q path=%q request_ua=%q err=%s",
+				userID, strings.Join(missingIDs, ","), r.URL.RequestURI(), r.UserAgent(), fetchErr.Error())
+		}
+	}
+	return mergePlaybackProgressIntoResumePayload(payload, progresses, details, resumeRequestLimit(r))
+}
+
+func (p *Proxy) filterActivePlaybackProgress(progresses []models.EmbyPlaybackProgress, userID string, now time.Time) []models.EmbyPlaybackProgress {
+	out := progresses[:0]
+	for _, progress := range progresses {
+		if !playbackProgressCanResume(progress) {
+			continue
+		}
+		if p.playbackManuallyCleared([]string{userID}, progress.EmbyItemID, playbackSessionState{}, now) {
+			continue
+		}
+		out = append(out, progress)
+	}
+	return out
+}
+
+func playbackProgressCanResume(progress models.EmbyPlaybackProgress) bool {
+	return strings.TrimSpace(progress.EmbyItemID) != "" &&
+		progress.ClearedAt == nil &&
+		!progress.Played &&
+		progress.PositionTicks >= playbackResumeTicks
+}
+
+func missingResumeProgressItemIDs(payload map[string]any, progresses []models.EmbyPlaybackProgress) []string {
+	existing := map[string]struct{}{}
+	if items, ok := payload["Items"].([]any); ok {
+		for _, raw := range items {
+			item, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			if itemID := stringFromAny(item["Id"]); itemID != "" {
+				existing[itemID] = struct{}{}
+			}
+		}
+	}
+	seen := map[string]struct{}{}
+	ids := make([]string, 0)
+	for _, progress := range progresses {
+		itemID := strings.TrimSpace(progress.EmbyItemID)
+		if itemID == "" {
+			continue
+		}
+		if _, ok := existing[itemID]; ok {
+			continue
+		}
+		if _, ok := seen[itemID]; ok {
+			continue
+		}
+		seen[itemID] = struct{}{}
+		ids = append(ids, itemID)
+	}
+	return ids
+}
+
+func mergePlaybackProgressIntoResumePayload(payload map[string]any, progresses []models.EmbyPlaybackProgress, details map[string]map[string]any, limit int) (bool, int, int) {
+	rawItems, _ := payload["Items"].([]any)
+	items := make([]any, 0, len(rawItems)+len(progresses))
+	itemIndex := map[string]int{}
+	originalIndex := map[string]int{}
+	for _, raw := range rawItems {
+		index := len(items)
+		items = append(items, raw)
+		item, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		itemID := stringFromAny(item["Id"])
+		if itemID == "" {
+			continue
+		}
+		itemIndex[itemID] = index
+		originalIndex[itemID] = index
+	}
+	changed := false
+	added := 0
+	updated := 0
+	progressUpdatedAt := map[string]time.Time{}
+	for _, progress := range progresses {
+		if !playbackProgressCanResume(progress) {
+			continue
+		}
+		itemID := strings.TrimSpace(progress.EmbyItemID)
+		if index, ok := itemIndex[itemID]; ok {
+			progressUpdatedAt[itemID] = progress.UpdatedAt
+			item, ok := items[index].(map[string]any)
+			if ok && applyPlaybackProgressToResumeItem(item, progress) {
+				changed = true
+				updated++
+			}
+			continue
+		}
+		detail := details[itemID]
+		if detail == nil {
+			continue
+		}
+		progressUpdatedAt[itemID] = progress.UpdatedAt
+		applyPlaybackProgressToResumeItem(detail, progress)
+		itemIndex[itemID] = len(items)
+		originalIndex[itemID] = len(items)
+		items = append(items, detail)
+		changed = true
+		added++
+	}
+	if len(progressUpdatedAt) > 0 {
+		sort.SliceStable(items, func(i, j int) bool {
+			leftID := resumeRawItemID(items[i])
+			rightID := resumeRawItemID(items[j])
+			leftTime, leftOK := progressUpdatedAt[leftID]
+			rightTime, rightOK := progressUpdatedAt[rightID]
+			if leftOK && rightOK && !leftTime.Equal(rightTime) {
+				return leftTime.After(rightTime)
+			}
+			if leftOK != rightOK {
+				return leftOK
+			}
+			return originalIndex[leftID] < originalIndex[rightID]
+		})
+		changed = true
+	}
+	if limit > 0 && len(items) > limit {
+		items = items[:limit]
+		changed = true
+	}
+	if changed {
+		payload["Items"] = items
+		payload["TotalRecordCount"] = len(items)
+	}
+	return changed, added, updated
+}
+
+func applyPlaybackProgressToResumeItem(item map[string]any, progress models.EmbyPlaybackProgress) bool {
+	if item == nil {
+		return false
+	}
+	changed := false
+	if strings.TrimSpace(stringFromAny(item["Id"])) == "" && strings.TrimSpace(progress.EmbyItemID) != "" {
+		item["Id"] = strings.TrimSpace(progress.EmbyItemID)
+		changed = true
+	}
+	userData, _ := item["UserData"].(map[string]any)
+	if userData == nil {
+		userData = map[string]any{}
+		item["UserData"] = userData
+		changed = true
+	}
+	if current, ok := int64FromAny(userData["PlaybackPositionTicks"]); !ok || current != progress.PositionTicks {
+		userData["PlaybackPositionTicks"] = progress.PositionTicks
+		changed = true
+	}
+	if played, ok := boolFromAny(userData["Played"]); !ok || played {
+		userData["Played"] = false
+		changed = true
+	}
+	if progress.DurationTicks > 0 {
+		if current, ok := int64FromAny(item["RunTimeTicks"]); !ok || current != progress.DurationTicks {
+			item["RunTimeTicks"] = progress.DurationTicks
+			changed = true
+		}
+		if current, ok := int64FromAny(userData["PlayedPercentage"]); !ok || current != progress.PositionTicks*100/progress.DurationTicks {
+			userData["PlayedPercentage"] = float64(progress.PositionTicks) * 100 / float64(progress.DurationTicks)
+			changed = true
+		}
+		if sources, ok := item["MediaSources"].([]any); ok {
+			for _, raw := range sources {
+				source, ok := raw.(map[string]any)
+				if !ok {
+					continue
+				}
+				if current, ok := int64FromAny(source["RunTimeTicks"]); !ok || current != progress.DurationTicks {
+					source["RunTimeTicks"] = progress.DurationTicks
+					changed = true
+				}
+			}
+		}
+	}
+	return changed
+}
+
+func resumeRawItemID(raw any) string {
+	item, _ := raw.(map[string]any)
+	if item == nil {
+		return ""
+	}
+	return stringFromAny(item["Id"])
+}
+
+func resumeRequestAllowsVideo(r *http.Request) bool {
+	if r == nil || r.URL == nil {
+		return true
+	}
+	mediaTypes := strings.TrimSpace(r.URL.Query().Get("MediaTypes"))
+	if mediaTypes == "" {
+		return true
+	}
+	for _, mediaType := range strings.Split(mediaTypes, ",") {
+		if strings.EqualFold(strings.TrimSpace(mediaType), "Video") {
+			return true
+		}
+	}
+	return false
+}
+
+func resumeRequestLimit(r *http.Request) int {
+	if r == nil || r.URL == nil {
+		return 0
+	}
+	for _, key := range []string{"Limit", "limit"} {
+		if limit, ok := int64FromString(r.URL.Query().Get(key)); ok && limit > 0 {
+			return int(limit)
+		}
+	}
+	return 0
+}
+
+func resumeLedgerFetchLimit(r *http.Request) int {
+	limit := resumeRequestLimit(r)
+	if limit < 50 {
+		return 50
+	}
+	if limit > 200 {
+		return 200
+	}
+	return limit
+}
+
+func resumeRequestStartIndex(r *http.Request) int {
+	if r == nil || r.URL == nil {
+		return 0
+	}
+	for _, key := range []string{"StartIndex", "startIndex"} {
+		if start, ok := int64FromString(r.URL.Query().Get(key)); ok && start > 0 {
+			return int(start)
+		}
+	}
+	return 0
+}
+
+func (p *Proxy) embyItemsByIDs(ctx context.Context, settings models.P115Settings, r *http.Request, userID string, ids []string) (map[string]map[string]any, error) {
+	unique := make([]string, 0, len(ids))
+	seen := map[string]struct{}{}
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		unique = append(unique, id)
+	}
+	if len(unique) == 0 {
+		return map[string]map[string]any{}, nil
+	}
+	query := url.Values{}
+	query.Set("Ids", strings.Join(unique, ","))
+	query.Set("Fields", "Path,MediaSources,MediaStreams,UserData,RunTimeTicks,Overview,PrimaryImageAspectRatio")
+	apiPath := "/Users/" + url.PathEscape(userID) + "/Items?" + query.Encode()
+	body, _, err := p.doEmbyRequest(ctx, settings, r, http.MethodGet, apiPath, nil)
+	if err != nil {
+		return nil, err
+	}
+	var payload map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	if err := decoder.Decode(&payload); err != nil {
+		return nil, err
+	}
+	items, _ := payload["Items"].([]any)
+	out := make(map[string]map[string]any, len(items))
+	for _, raw := range items {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		itemID := stringFromAny(item["Id"])
+		if itemID == "" {
+			continue
+		}
+		out[itemID] = item
+	}
+	return out, nil
+}
+
 func (p *Proxy) rewriteItemMediaSources(resp *http.Response, reqPath string) error {
 	started := time.Now()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
@@ -821,26 +2068,128 @@ func (p *Proxy) rewriteItemMediaSources(resp *http.Response, reqPath string) err
 	_ = resp.Body.Close()
 	var payload any
 	if err := json.Unmarshal(body, &payload); err != nil {
+		setNoStoreHeaders(resp.Header)
 		resp.Body = io.NopCloser(bytes.NewReader(body))
 		return nil
 	}
 	prewarm := shouldPrewarmItemMediaSources(reqPath)
+	hillsItems := hillsClientRequest(resp.Request)
+	if hillsItems {
+		logHillsJSONItems(resp.Request, payload, "before")
+	}
+	sanitized, removed := sanitizeHillsResumeLikeItems(resp.Request, payload)
 	changed := p.rewriteMediaSourcesInValue(resp.Request.Context(), resp.Request, payload, "", true, prewarm)
-	if !changed {
+	if hillsItems && sanitized {
+		logHillsJSONItems(resp.Request, payload, "after")
+	}
+	if !changed && !sanitized {
+		setNoStoreHeaders(resp.Header)
 		playdiag.Printf("curio emby rewrite items no-match path=%q request_ua=%q elapsed_ms=%d body_bytes=%d", resp.Request.URL.RequestURI(), resp.Request.UserAgent(), time.Since(started).Milliseconds(), len(body))
 		resp.Body = io.NopCloser(bytes.NewReader(body))
 		return nil
 	}
-	playdiag.Printf("curio emby rewrite items changed path=%q request_ua=%q prewarm=%t elapsed_ms=%d body_bytes=%d", resp.Request.URL.RequestURI(), resp.Request.UserAgent(), prewarm, time.Since(started).Milliseconds(), len(body))
+	playdiag.Printf("curio emby rewrite items changed path=%q request_ua=%q prewarm=%t sanitized=%t removed=%d elapsed_ms=%d body_bytes=%d", resp.Request.URL.RequestURI(), resp.Request.UserAgent(), prewarm, sanitized, removed, time.Since(started).Milliseconds(), len(body))
 	next, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
-	resp.Body = io.NopCloser(bytes.NewReader(next))
-	resp.ContentLength = int64(len(next))
-	resp.Header.Set("Content-Length", strconvI64(resp.ContentLength))
-	resp.Header.Set("Content-Type", "application/json; charset=utf-8")
+	setRewrittenJSONResponse(resp, next)
 	return nil
+}
+
+func sanitizeHillsResumeLikeItems(r *http.Request, payload any) (bool, int) {
+	if !hillsClientRequest(r) || !hillsResumeLikeRequest(r) {
+		return false, 0
+	}
+	root, ok := payload.(map[string]any)
+	if !ok {
+		return false, 0
+	}
+	items, ok := root["Items"].([]any)
+	if !ok {
+		return false, 0
+	}
+	out := make([]any, 0, len(items))
+	removed := 0
+	for _, raw := range items {
+		item, ok := raw.(map[string]any)
+		if ok && !resumeItemHasMeaningfulProgress(item) {
+			removed++
+			continue
+		}
+		out = append(out, raw)
+	}
+	if removed == 0 {
+		return false, 0
+	}
+	root["Items"] = out
+	root["TotalRecordCount"] = len(out)
+	return true, removed
+}
+
+func hillsResumeLikeRequest(r *http.Request) bool {
+	if r == nil || r.URL == nil {
+		return false
+	}
+	query := r.URL.Query()
+	for _, filter := range strings.Split(query.Get("Filters"), ",") {
+		if strings.EqualFold(strings.TrimSpace(filter), "IsResumable") {
+			return true
+		}
+	}
+	for _, sortBy := range strings.Split(query.Get("SortBy"), ",") {
+		if strings.EqualFold(strings.TrimSpace(sortBy), "DatePlayed") {
+			return true
+		}
+	}
+	return false
+}
+
+func hillsClientRequest(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	values := []string{
+		r.UserAgent(),
+		r.Header.Get("X-Emby-Client"),
+		r.URL.Query().Get("X-Emby-Client"),
+		embyAuthorizationField(r.Header.Get("X-Emby-Authorization"), "Client"),
+		embyAuthorizationField(r.URL.Query().Get("X-Emby-Authorization"), "Client"),
+	}
+	for _, value := range values {
+		if strings.Contains(strings.ToLower(value), "hills") {
+			return true
+		}
+	}
+	return false
+}
+
+func logHillsJSONItems(r *http.Request, payload any, stage string) {
+	root, ok := payload.(map[string]any)
+	if !ok {
+		return
+	}
+	items, ok := root["Items"].([]any)
+	if !ok {
+		return
+	}
+	limit := len(items)
+	if limit > 8 {
+		limit = 8
+	}
+	parts := make([]string, 0, limit)
+	for _, raw := range items[:limit] {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		userData, _ := item["UserData"].(map[string]any)
+		pos, _ := int64FromAny(userData["PlaybackPositionTicks"])
+		played, _ := boolFromAny(userData["Played"])
+		parts = append(parts, stringFromAny(item["Id"])+":"+stringFromAny(item["Type"])+":"+stringFromAny(item["SeriesName"])+":"+stringFromAny(item["Name"])+":pos="+strconvI64(pos)+":played="+strconv.FormatBool(played))
+	}
+	playdiag.Printf("curio emby hills items %s path=%q total=%s first=%q request_ua=%q",
+		stage, r.URL.RequestURI(), stringFromAny(root["TotalRecordCount"]), strings.Join(parts, " | "), r.UserAgent())
 }
 
 func shouldPrewarmItemMediaSources(raw string) bool {
@@ -927,6 +2276,7 @@ func (p *Proxy) rewriteMediaSource(ctx context.Context, r *http.Request, itemID 
 			STRMPath:     link.STRMPath,
 			Status:       "active",
 		})
+		p.rememberPlaybackRequestContext(r, itemID, link)
 	}
 	if prewarm && itemID != "" {
 		p.prewarmPlayURL(link.ID, publicBase(r), resolveUA)
@@ -961,12 +2311,14 @@ func (p *Proxy) rewritePlaybackInfo(resp *http.Response, settings models.P115Set
 	_ = resp.Body.Close()
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
+		setNoStoreHeaders(resp.Header)
 		resp.Body = io.NopCloser(bytes.NewReader(body))
 		return nil
 	}
 	itemID := playbackItemID(proxyPath(settings, resp.Request.URL.Path))
 	sources, ok := payload["MediaSources"].([]any)
 	if !ok {
+		setNoStoreHeaders(resp.Header)
 		resp.Body = io.NopCloser(bytes.NewReader(body))
 		return nil
 	}
@@ -980,6 +2332,7 @@ func (p *Proxy) rewritePlaybackInfo(resp *http.Response, settings models.P115Set
 		changed = ok || changed
 	}
 	if !changed {
+		setNoStoreHeaders(resp.Header)
 		playdiag.Printf("curio emby rewrite playback no-match item=%q path=%q request_ua=%q sources=%d elapsed_ms=%d body_bytes=%d", itemID, resp.Request.URL.RequestURI(), resp.Request.UserAgent(), len(sources), time.Since(started).Milliseconds(), len(body))
 		resp.Body = io.NopCloser(bytes.NewReader(body))
 		return nil
@@ -989,10 +2342,7 @@ func (p *Proxy) rewritePlaybackInfo(resp *http.Response, settings models.P115Set
 	if err != nil {
 		return err
 	}
-	resp.Body = io.NopCloser(bytes.NewReader(next))
-	resp.ContentLength = int64(len(next))
-	resp.Header.Set("Content-Length", strconvI64(resp.ContentLength))
-	resp.Header.Set("Content-Type", "application/json; charset=utf-8")
+	setRewrittenJSONResponse(resp, next)
 	return nil
 }
 
@@ -1041,7 +2391,7 @@ func applyDirectPlayMediaSource(mediaSource map[string]any, r *http.Request, pla
 	mediaSource["SupportsDirectStream"] = true
 	mediaSource["SupportsTranscoding"] = false
 	mediaSource["AddApiKeyToDirectStreamUrl"] = false
-	mediaSource["SupportsProbing"] = !mediaSourceHasStreams(mediaSource)
+	mediaSource["SupportsProbing"] = false
 	mediaSource["HasMixedProtocols"] = false
 	mediaSource["RequiresOpening"] = false
 	mediaSource["RequiresClosing"] = false
@@ -1061,11 +2411,6 @@ func applyRunTimeTicks(value map[string]any, durationTicks int64) {
 		return
 	}
 	value["RunTimeTicks"] = durationTicks
-}
-
-func mediaSourceHasStreams(mediaSource map[string]any) bool {
-	streams, ok := mediaSource["MediaStreams"].([]any)
-	return ok && len(streams) > 0
 }
 
 func mediaContainerForLink(link models.STRMLink) string {
@@ -1123,44 +2468,79 @@ func ensureMediaStreams(mediaSource map[string]any, _ models.STRMLink, streams [
 
 func (p *Proxy) mediaStreamsForLink(ctx context.Context, r *http.Request, link models.STRMLink, allowProbe bool, resolveUA string) ([]any, int64) {
 	cachedStreams, hasCachedStreams := decodeStoredMediaStreams(link.MediaStreams)
-	if hasCachedStreams && link.MediaDurationTicks > 0 {
-		return cachedStreams, link.MediaDurationTicks
+	durationTicks := link.MediaDurationTicks
+	if hasCachedStreams && durationTicks > 0 {
+		return cachedStreams, durationTicks
 	}
 	if strings.TrimSpace(link.MediaProbeError) != "" && link.MediaProbedAt != nil && time.Since(*link.MediaProbedAt) < 6*time.Hour {
 		if hasCachedStreams {
-			return cachedStreams, link.MediaDurationTicks
+			return cachedStreams, durationTicks
 		}
-		return nil, 0
+		return nil, durationTicks
 	}
-	if !allowProbe || p == nil || p.play == nil || p.store == nil {
-		if hasCachedStreams {
-			return cachedStreams, link.MediaDurationTicks
-		}
-		return nil, 0
+	if allowProbe && p != nil && p.play != nil && p.store != nil {
+		p.scheduleMediaProbe(link, publicBase(r), resolveUA)
 	}
-	streams, durationTicks, err := p.probeMediaStreamsForLink(ctx, r, link, resolveUA)
-	if err != nil {
-		_ = p.store.UpdateSTRMLinkMediaStreams(ctx, link.ID, "", 0, err.Error())
-		playdiag.Printf("curio emby media probe failed link=%s path=%q err=%s", shortProxyLogValue(link.ID, 16), link.RelativePath, err.Error())
-		if hasCachedStreams {
-			return cachedStreams, link.MediaDurationTicks
-		}
-		return nil, 0
+	if hasCachedStreams {
+		return cachedStreams, durationTicks
 	}
-	body, err := json.Marshal(streams)
-	if err != nil {
-		playdiag.Printf("curio emby media probe marshal failed link=%s path=%q err=%s", shortProxyLogValue(link.ID, 16), link.RelativePath, err.Error())
-		return streams, durationTicks
-	}
-	_ = p.store.UpdateSTRMLinkMediaStreams(ctx, link.ID, string(body), durationTicks, "")
-	playdiag.Printf("curio emby media probe ok link=%s path=%q streams=%d duration_ticks=%d", shortProxyLogValue(link.ID, 16), link.RelativePath, len(streams), durationTicks)
-	return streams, durationTicks
+	return nil, durationTicks
 }
 
-func (p *Proxy) probeMediaStreamsForLink(ctx context.Context, r *http.Request, link models.STRMLink, resolveUA string) ([]any, int64, error) {
-	probeCtx, cancel := context.WithTimeout(ctx, 75*time.Second)
-	defer cancel()
-	directURL, err := p.play.ResolvePlayURLFromRoute(probeCtx, "id/"+link.ID, publicBase(r), resolveUA)
+func (p *Proxy) scheduleMediaProbe(link models.STRMLink, baseURL, resolveUA string) {
+	if p == nil || p.play == nil || p.store == nil || strings.TrimSpace(link.ID) == "" {
+		return
+	}
+	if streams, ok := decodeStoredMediaStreams(link.MediaStreams); ok && len(streams) > 0 && link.MediaDurationTicks > 0 {
+		return
+	}
+	key := link.ID + "\x00" + strings.TrimSpace(resolveUA)
+	if !p.markMediaProbeScheduled(key) {
+		playdiag.Printf("curio emby media probe skipped link=%s path=%q reason=%q", shortProxyLogValue(link.ID, 16), link.RelativePath, "duplicate")
+		return
+	}
+	playdiag.Printf("curio emby media probe scheduled link=%s path=%q delay_ms=%d", shortProxyLogValue(link.ID, 16), link.RelativePath, mediaProbeStartDelay.Milliseconds())
+	go func() {
+		timer := time.NewTimer(mediaProbeStartDelay)
+		defer timer.Stop()
+		<-timer.C
+		if p.mediaProbeSlots != nil {
+			select {
+			case p.mediaProbeSlots <- struct{}{}:
+			default:
+				p.clearMediaProbeScheduled(key)
+				playdiag.Printf("curio emby media probe skipped link=%s path=%q reason=%q", shortProxyLogValue(link.ID, 16), link.RelativePath, "busy")
+				return
+			}
+		}
+		if p.mediaProbeSlots != nil {
+			defer func() { <-p.mediaProbeSlots }()
+		}
+		started := time.Now()
+		probeCtx, cancel := context.WithTimeout(context.Background(), mediaProbeTimeout)
+		defer cancel()
+		streams, durationTicks, err := p.probeMediaStreamsForLink(probeCtx, link, baseURL, resolveUA)
+		if err != nil {
+			updateCtx, updateCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = p.store.UpdateSTRMLinkMediaStreams(updateCtx, link.ID, "", 0, err.Error())
+			updateCancel()
+			playdiag.Printf("curio emby media probe failed link=%s path=%q elapsed_ms=%d err=%s", shortProxyLogValue(link.ID, 16), link.RelativePath, time.Since(started).Milliseconds(), err.Error())
+			return
+		}
+		body, err := json.Marshal(streams)
+		if err != nil {
+			playdiag.Printf("curio emby media probe marshal failed link=%s path=%q elapsed_ms=%d err=%s", shortProxyLogValue(link.ID, 16), link.RelativePath, time.Since(started).Milliseconds(), err.Error())
+			return
+		}
+		updateCtx, updateCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = p.store.UpdateSTRMLinkMediaStreams(updateCtx, link.ID, string(body), durationTicks, "")
+		updateCancel()
+		playdiag.Printf("curio emby media probe ok link=%s path=%q streams=%d duration_ticks=%d elapsed_ms=%d", shortProxyLogValue(link.ID, 16), link.RelativePath, len(streams), durationTicks, time.Since(started).Milliseconds())
+	}()
+}
+
+func (p *Proxy) probeMediaStreamsForLink(ctx context.Context, link models.STRMLink, baseURL, resolveUA string) ([]any, int64, error) {
+	directURL, err := p.play.ResolvePlayURLFromRoute(ctx, "id/"+link.ID, baseURL, resolveUA)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -1170,7 +2550,7 @@ func (p *Proxy) probeMediaStreamsForLink(ctx context.Context, r *http.Request, l
 		Extension: strings.TrimPrefix(strings.ToLower(path.Ext(firstNonEmpty(link.RelativePath, link.RemotePath, link.STRMPath))), "."),
 		Size:      link.Size,
 	}
-	detailed, err := mediainfo.ProbeDetailed(probeCtx, source)
+	detailed, err := mediainfo.ProbeDetailed(ctx, source)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -1574,6 +2954,9 @@ func (p *Proxy) prewarmAdjacentPlayURLs(ctx context.Context, link models.STRMLin
 	if p == nil || p.store == nil || adjacentPrewarmLimit <= 0 {
 		return
 	}
+	if link.MediaDurationTicks <= 0 && strings.TrimSpace(link.MediaStreams) == "" {
+		return
+	}
 	links, err := p.store.NextSTRMLinks(ctx, link, adjacentPrewarmLimit)
 	if err != nil || len(links) == 0 {
 		return
@@ -1606,6 +2989,34 @@ func (p *Proxy) markPrewarmScheduled(key string) bool {
 	return true
 }
 
+func (p *Proxy) markMediaProbeScheduled(key string) bool {
+	if p.mediaProbeRecent == nil {
+		return true
+	}
+	now := time.Now()
+	p.mediaProbeMu.Lock()
+	defer p.mediaProbeMu.Unlock()
+	for existingKey, scheduledAt := range p.mediaProbeRecent {
+		if now.Sub(scheduledAt) > mediaProbeDedupeWindow {
+			delete(p.mediaProbeRecent, existingKey)
+		}
+	}
+	if scheduledAt, ok := p.mediaProbeRecent[key]; ok && now.Sub(scheduledAt) <= mediaProbeDedupeWindow {
+		return false
+	}
+	p.mediaProbeRecent[key] = now
+	return true
+}
+
+func (p *Proxy) clearMediaProbeScheduled(key string) {
+	if p.mediaProbeRecent == nil {
+		return
+	}
+	p.mediaProbeMu.Lock()
+	defer p.mediaProbeMu.Unlock()
+	delete(p.mediaProbeRecent, key)
+}
+
 func proxyPath(settings models.P115Settings, raw string) string {
 	base := configuredProxyBasePath(settings)
 	if strings.HasPrefix(raw, base+"/") {
@@ -1615,6 +3026,29 @@ func proxyPath(settings models.P115Settings, raw string) string {
 		return "/"
 	}
 	return raw
+}
+
+func playbackRequestUserID(r *http.Request) string {
+	if r == nil || r.URL == nil {
+		return ""
+	}
+	query := r.URL.Query()
+	if userID := firstNonEmpty(query.Get("UserId"), query.Get("UserID"), query.Get("userId")); userID != "" {
+		return userID
+	}
+	if match := userPathPattern.FindStringSubmatch(strings.TrimLeft(r.URL.Path, "/")); len(match) == 2 {
+		return unescapePathValue(match[1])
+	}
+	if userID := embyAuthorizationField(query.Get("X-Emby-Authorization"), "UserId"); userID != "" {
+		return userID
+	}
+	if userID := embyAuthorizationField(query.Get("Authorization"), "UserId"); userID != "" {
+		return userID
+	}
+	if userID := embyAuthorizationField(r.Header.Get("X-Emby-Authorization"), "UserId"); userID != "" {
+		return userID
+	}
+	return embyAuthorizationField(r.Header.Get("Authorization"), "UserId")
 }
 
 func isPlaybackInfo(raw string) bool {
@@ -1923,15 +3357,66 @@ func writeFoundPlayRedirect(w http.ResponseWriter, directURL string) {
 
 func writePlayRedirect(w http.ResponseWriter, directURL string, statusCode int) {
 	h := w.Header()
-	h.Set("Cache-Control", "no-store, no-cache, must-revalidate")
-	h.Set("Pragma", "no-cache")
-	h.Set("Expires", "0")
+	setNoStoreHeaders(h)
 	h.Set("Vary", "User-Agent")
 	h.Set("Access-Control-Allow-Origin", "*")
 	h.Set("Access-Control-Expose-Headers", "Location")
 	h.Set("Location", directURL)
 	h.Set("X-Curio-Redirect", "115")
 	w.WriteHeader(statusCode)
+}
+
+func setRewrittenJSONResponse(resp *http.Response, body []byte) {
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	resp.ContentLength = int64(len(body))
+	resp.Header.Set("Content-Length", strconvI64(resp.ContentLength))
+	resp.Header.Set("Content-Type", "application/json; charset=utf-8")
+	setNoStoreHeaders(resp.Header)
+}
+
+func setNoStoreHeaders(h http.Header) {
+	h.Set("Cache-Control", "no-store, no-cache, max-age=0, private, must-revalidate")
+	h.Set("CDN-Cache-Control", "no-store")
+	h.Set("Surrogate-Control", "no-store")
+	h.Set("Edge-Control", "no-store")
+	h.Set("Pragma", "no-cache")
+	h.Set("Expires", "0")
+	addVaryHeaders(h, "Authorization", "X-Emby-Token", "X-MediaBrowser-Token", "X-Emby-Client", "User-Agent")
+}
+
+func addVaryHeaders(h http.Header, names ...string) {
+	if h == nil {
+		return
+	}
+	seen := map[string]struct{}{}
+	values := make([]string, 0, len(names))
+	for _, line := range h.Values("Vary") {
+		for _, raw := range strings.Split(line, ",") {
+			name := strings.TrimSpace(raw)
+			if name == "" {
+				continue
+			}
+			key := strings.ToLower(name)
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			values = append(values, name)
+		}
+	}
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		key := strings.ToLower(name)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		values = append(values, name)
+	}
+	h.Set("Vary", strings.Join(values, ", "))
 }
 
 func playbackResolveUserAgent(r *http.Request) string {
@@ -1968,6 +3453,11 @@ func joinURLPath(basePath, reqPath string) string {
 
 func stableEmbyID(serverID, itemID string) string {
 	sum := sha256.Sum256([]byte(serverID + ":" + itemID))
+	return hex.EncodeToString(sum[:])
+}
+
+func stablePlaybackProgressID(serverID, userID, itemID string) string {
+	sum := sha256.Sum256([]byte(serverID + ":" + userID + ":" + itemID))
 	return hex.EncodeToString(sum[:])
 }
 

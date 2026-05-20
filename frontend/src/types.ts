@@ -123,6 +123,23 @@ export type STRMSyncResult = {
   failed: number;
 };
 
+export type STRMPreviewItem = {
+  library_cid: string;
+  library_name: string;
+  relative_path: string;
+  strm_path: string;
+  play_path: string;
+  size: number;
+};
+
+export type STRMPreview = {
+  items: STRMPreviewItem[];
+  total: number;
+  limit: number;
+  source: string;
+  message?: string;
+};
+
 export type P115SyncRun = {
   id: string;
   trigger: string;
@@ -171,6 +188,7 @@ export type LogPage = {
   items: LogEntry[];
   total: number;
   limit: number;
+  offset: number;
   type: string;
 };
 

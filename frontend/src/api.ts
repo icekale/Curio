@@ -1,15 +1,16 @@
 import type {
-  Batch,
   AuthLoginResult,
   AuthStatus,
+  Batch,
   ClassificationConfig,
-  Collection,
-  CollectionPage,
   CloudDriveFile,
   CloudDriveSettings,
   CloudDriveStatus,
+  Collection,
+  CollectionPage,
   DirectoryConfig,
   Health,
+  LogEntry,
   LogPage,
   MediaFile,
   MediaFilePage,
@@ -20,10 +21,11 @@ import type {
   P115QRCodeSession,
   P115QRCodeStatus,
   P115Settings,
-  P115SyncRun,
   P115Status,
+  P115SyncRun,
   RearchiveBatchResult,
   RearchivePayload,
+  STRMPreview,
   STRMSyncResult,
   SystemSettings,
   TVShow,
@@ -97,6 +99,7 @@ type MediaListParams = {
 type LogListParams = {
   type?: string;
   limit?: number;
+  offset?: number;
 };
 
 function withMediaParams(path: string, params: MediaListParams = {}) {
@@ -113,6 +116,7 @@ function withLogParams(path: string, params: LogListParams = {}) {
   const query = new URLSearchParams();
   if (params.type?.trim()) query.set("type", params.type.trim());
   if (params.limit) query.set("limit", String(params.limit));
+  if (params.offset) query.set("offset", String(params.offset));
   const suffix = query.toString();
   return suffix ? `${path}?${suffix}` : path;
 }
@@ -193,6 +197,11 @@ export const endpoints = {
     api<STRMSyncResult>("/api/p115/export-tree", { method: "POST" }),
   rebuildP115Nodes: () =>
     api<STRMSyncResult>("/api/p115/nodes/rebuild", { method: "POST" }),
+  previewP115STRM: (payload: unknown) =>
+    api<STRMPreview>("/api/p115/strm/preview?limit=50", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
   syncP115STRM: () =>
     api<STRMSyncResult>("/api/p115/strm/sync", { method: "POST" }),
   cleanupP115STRM: () =>
@@ -200,6 +209,8 @@ export const endpoints = {
   p115SyncRuns: () => api<P115SyncRun[]>("/api/p115/sync-runs?limit=20"),
   logs: (params?: LogListParams) =>
     api<LogPage>(withLogParams("/api/logs", params)),
+  logDetail: (id: string) =>
+    api<LogEntry>(`/api/logs/${encodeURIComponent(id)}`),
   classification: () =>
     api<ClassificationConfig>("/api/settings/classification"),
   saveClassification: (payload: unknown) =>
@@ -254,7 +265,8 @@ export const endpoints = {
   curatedCollection: (id: string) =>
     api<Collection>(`/api/curated-collections/${encodeURIComponent(id)}`),
   refreshCuratedCollection: (id: string) =>
-    api<Collection>(`/api/curated-collections/${encodeURIComponent(id)}/refresh`, {
-      method: "POST",
-    }),
+    api<Collection>(
+      `/api/curated-collections/${encodeURIComponent(id)}/refresh`,
+      { method: "POST" },
+    ),
 };
