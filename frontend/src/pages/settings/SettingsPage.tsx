@@ -44,6 +44,12 @@ import {
 import { StatusPill } from "../../components/StatusPill";
 
 type SettingsTab = "base" | "scraper" | "network" | "ai" | "cloud" | "p115" | "emby";
+type RevealSecret = (
+  key: string,
+  field: string,
+  currentValue: string,
+  patch: (value: string) => void,
+) => void | Promise<void>;
 
 const settingsTabs = [
   { id: "base", label: "本地目录", summary: "入库与整理目录", icon: HardDrive },
@@ -60,6 +66,11 @@ const settingsTabs = [
   icon: typeof HardDrive;
 }[];
 
+function isHiddenSecret(value: string) {
+  const trimmed = value.trim();
+  return trimmed !== "" && trimmed.replaceAll("*", "") === "";
+}
+
 export function SettingsPage({ console }: { console: CurioConsole }) {
   const [visibleSecrets, setVisibleSecrets] = useState<Record<string, boolean>>({});
   const [settingsTab, setSettingsTab] = useState<SettingsTab>("base");
@@ -68,14 +79,64 @@ export function SettingsPage({ console }: { console: CurioConsole }) {
   );
   const lastNetworkProxy = useRef(console.systemSettings.network_proxy);
   const secretVisible = (key: string) => Boolean(visibleSecrets[key]);
-  const toggleSecret = (key: string) =>
-    setVisibleSecrets((current) => ({ ...current, [key]: !current[key] }));
 
   useEffect(() => {
     if (lastNetworkProxy.current === console.systemSettings.network_proxy) return;
     lastNetworkProxy.current = console.systemSettings.network_proxy;
     setNetworkProxyDraft(parseNetworkProxy(console.systemSettings.network_proxy));
   }, [console.systemSettings.network_proxy]);
+
+  const setSecretVisible = (key: string, visible: boolean) =>
+    setVisibleSecrets((current) => ({ ...current, [key]: visible }));
+  const toggleLocalSecret = (key: string) =>
+    setVisibleSecrets((current) => ({ ...current, [key]: !current[key] }));
+
+  const revealSecret = async (
+    key: string,
+    scope: "system" | "clouddrive" | "p115",
+    field: string,
+    currentValue: string,
+    applyValue: (value: string) => void,
+  ) => {
+    if (secretVisible(key)) {
+      setSecretVisible(key, false);
+      return;
+    }
+    if (isHiddenSecret(currentValue)) {
+      try {
+        const value = await console.revealSettingSecret(scope, field);
+        applyValue(value || "");
+      } catch (error) {
+        console.showToast(
+          error instanceof Error ? error.message : "敏感配置读取失败",
+          "error",
+        );
+        return;
+      }
+    }
+    setSecretVisible(key, true);
+  };
+
+  const revealSystemSecret = (
+    key: string,
+    field: string,
+    currentValue: string,
+    patch: (value: string) => void,
+  ) => revealSecret(key, "system", field, currentValue, patch);
+
+  const revealCloudSecret = (
+    key: string,
+    field: string,
+    currentValue: string,
+    patch: (value: string) => void,
+  ) => revealSecret(key, "clouddrive", field, currentValue, patch);
+
+  const revealP115Secret = (
+    key: string,
+    field: string,
+    currentValue: string,
+    patch: (value: string) => void,
+  ) => revealSecret(key, "p115", field, currentValue, patch);
 
   const updateNetworkProxy = (patch: Partial<NetworkProxyDraft>) => {
     setNetworkProxyDraft((current) => {
@@ -85,6 +146,12 @@ export function SettingsPage({ console }: { console: CurioConsole }) {
       console.setSystemSettings({ ...console.systemSettings, network_proxy: networkProxy });
       return next;
     });
+  };
+
+  const setNetworkProxyValue = (value: string) => {
+    lastNetworkProxy.current = value;
+    setNetworkProxyDraft(parseNetworkProxy(value));
+    console.setSystemSettings({ ...console.systemSettings, network_proxy: value });
   };
 
   return (
@@ -112,28 +179,50 @@ export function SettingsPage({ console }: { console: CurioConsole }) {
       <div className="settingsContent">
         {settingsTab === "base" && <BaseSettings console={console} />}
         {settingsTab === "scraper" && (
-          <ScraperSettings console={console} secretVisible={secretVisible} toggleSecret={toggleSecret} />
+          <ScraperSettings
+            console={console}
+            secretVisible={secretVisible}
+            revealSystemSecret={revealSystemSecret}
+          />
         )}
         {settingsTab === "network" && (
           <NetworkSettings
             console={console}
             draft={networkProxyDraft}
             updateDraft={updateNetworkProxy}
+            setNetworkProxyValue={setNetworkProxyValue}
             secretVisible={secretVisible}
-            toggleSecret={toggleSecret}
+            revealSystemSecret={revealSystemSecret}
           />
         )}
         {settingsTab === "ai" && (
-          <AISettings console={console} secretVisible={secretVisible} toggleSecret={toggleSecret} />
+          <AISettings
+            console={console}
+            secretVisible={secretVisible}
+            revealSystemSecret={revealSystemSecret}
+          />
         )}
         {settingsTab === "cloud" && (
-          <CloudSettings console={console} secretVisible={secretVisible} toggleSecret={toggleSecret} />
+          <CloudSettings
+            console={console}
+            secretVisible={secretVisible}
+            revealCloudSecret={revealCloudSecret}
+          />
         )}
         {settingsTab === "p115" && (
-          <P115SettingsPanel console={console} secretVisible={secretVisible} toggleSecret={toggleSecret} />
+          <P115SettingsPanel
+            console={console}
+            secretVisible={secretVisible}
+            revealP115Secret={revealP115Secret}
+            toggleLocalSecret={toggleLocalSecret}
+          />
         )}
         {settingsTab === "emby" && (
-          <EmbySettings console={console} secretVisible={secretVisible} toggleSecret={toggleSecret} />
+          <EmbySettings
+            console={console}
+            secretVisible={secretVisible}
+            revealP115Secret={revealP115Secret}
+          />
         )}
       </div>
     </section>
@@ -184,11 +273,11 @@ function BaseSettings({ console }: { console: CurioConsole }) {
 function ScraperSettings({
   console,
   secretVisible,
-  toggleSecret,
+  revealSystemSecret,
 }: {
   console: CurioConsole;
   secretVisible: (key: string) => boolean;
-  toggleSecret: (key: string) => void;
+  revealSystemSecret: RevealSecret;
 }) {
   return (
     <Card title="刮削源" eyebrow="TMDB">
@@ -199,7 +288,18 @@ function ScraperSettings({
           <SecretInput
             value={console.systemSettings.tmdb_api_key}
             visible={secretVisible("tmdb_api_key")}
-            onToggle={() => toggleSecret("tmdb_api_key")}
+            onToggle={() =>
+              revealSystemSecret(
+                "tmdb_api_key",
+                "tmdb_api_key",
+                console.systemSettings.tmdb_api_key,
+                (value) =>
+                  console.setSystemSettings({
+                    ...console.systemSettings,
+                    tmdb_api_key: value,
+                  }),
+              )
+            }
             onChange={(value) =>
               console.setSystemSettings({
                 ...console.systemSettings,
@@ -228,14 +328,16 @@ function NetworkSettings({
   console,
   draft,
   updateDraft,
+  setNetworkProxyValue,
   secretVisible,
-  toggleSecret,
+  revealSystemSecret,
 }: {
   console: CurioConsole;
   draft: NetworkProxyDraft;
   updateDraft: (patch: Partial<NetworkProxyDraft>) => void;
+  setNetworkProxyValue: (value: string) => void;
   secretVisible: (key: string) => boolean;
-  toggleSecret: (key: string) => void;
+  revealSystemSecret: RevealSecret;
 }) {
   return (
     <Card title="网络代理" eyebrow="Proxy">
@@ -286,9 +388,16 @@ function NetworkSettings({
           <span>密码</span>
           <SecretInput
             value={draft.password}
-            disabled={!draft.scheme}
+            disabled={!draft.scheme && !isHiddenSecret(console.systemSettings.network_proxy)}
             visible={secretVisible("network_proxy_password")}
-            onToggle={() => toggleSecret("network_proxy_password")}
+            onToggle={() =>
+              revealSystemSecret(
+                "network_proxy_password",
+                "network_proxy",
+                console.systemSettings.network_proxy,
+                setNetworkProxyValue,
+              )
+            }
             onChange={(value) => updateDraft({ password: value })}
           />
         </label>
@@ -311,11 +420,11 @@ function NetworkSettings({
 function AISettings({
   console,
   secretVisible,
-  toggleSecret,
+  revealSystemSecret,
 }: {
   console: CurioConsole;
   secretVisible: (key: string) => boolean;
-  toggleSecret: (key: string) => void;
+  revealSystemSecret: RevealSecret;
 }) {
   return (
     <Card title="AI 文件名识别" eyebrow="Filename Intelligence">
@@ -351,13 +460,26 @@ function AISettings({
         </div>
         <label className="field">
           <span>AI 接口地址</span>
-          <input
+          <SecretInput
             value={console.systemSettings.ai_base_url}
             placeholder="https://api.openai.com/v1"
-            onChange={(event) =>
+            visible={secretVisible("ai_base_url")}
+            onToggle={() =>
+              revealSystemSecret(
+                "ai_base_url",
+                "ai_base_url",
+                console.systemSettings.ai_base_url,
+                (value) =>
+                  console.setSystemSettings({
+                    ...console.systemSettings,
+                    ai_base_url: value,
+                  }),
+              )
+            }
+            onChange={(value) =>
               console.setSystemSettings({
                 ...console.systemSettings,
-                ai_base_url: event.target.value,
+                ai_base_url: value,
               })
             }
           />
@@ -380,7 +502,18 @@ function AISettings({
           <SecretInput
             value={console.systemSettings.ai_api_key}
             visible={secretVisible("ai_api_key")}
-            onToggle={() => toggleSecret("ai_api_key")}
+            onToggle={() =>
+              revealSystemSecret(
+                "ai_api_key",
+                "ai_api_key",
+                console.systemSettings.ai_api_key,
+                (value) =>
+                  console.setSystemSettings({
+                    ...console.systemSettings,
+                    ai_api_key: value,
+                  }),
+              )
+            }
             onChange={(value) =>
               console.setSystemSettings({
                 ...console.systemSettings,
@@ -421,11 +554,11 @@ function AISettings({
 function CloudSettings({
   console,
   secretVisible,
-  toggleSecret,
+  revealCloudSecret,
 }: {
   console: CurioConsole;
   secretVisible: (key: string) => boolean;
-  toggleSecret: (key: string) => void;
+  revealCloudSecret: RevealSecret;
 }) {
   const cloudFields = [
     ["address", "服务地址", "http://host.docker.internal:19798"],
@@ -437,6 +570,7 @@ function CloudSettings({
     ["failed_path", "失败目录", "/Curio/failed"],
     ["incomplete_collections_path", "缺失合集目录", "/Curio/incomplete_collections"],
   ] as const;
+  const revealFields = new Set(["address", "username", "password", "token"]);
 
   return (
     <>
@@ -446,12 +580,23 @@ function CloudSettings({
           {cloudFields.map(([key, label, placeholder]) => (
             <label className="field" key={key}>
               <span>{label}</span>
-              {key === "password" || key === "token" ? (
+              {revealFields.has(key) ? (
                 <SecretInput
                   value={String(console.cloudDriveSettings[key] ?? "")}
                   placeholder={placeholder}
                   visible={secretVisible(`cloud_${key}`)}
-                  onToggle={() => toggleSecret(`cloud_${key}`)}
+                  onToggle={() =>
+                    revealCloudSecret(
+                      `cloud_${key}`,
+                      key,
+                      String(console.cloudDriveSettings[key] ?? ""),
+                      (value) =>
+                        console.setCloudDriveSettings({
+                          ...console.cloudDriveSettings,
+                          [key]: value,
+                        }),
+                    )
+                  }
                   onChange={(value) =>
                     console.setCloudDriveSettings({
                       ...console.cloudDriveSettings,
@@ -515,11 +660,13 @@ function CloudSettings({
 function P115SettingsPanel({
   console,
   secretVisible,
-  toggleSecret,
+  revealP115Secret,
+  toggleLocalSecret,
 }: {
   console: CurioConsole;
   secretVisible: (key: string) => boolean;
-  toggleSecret: (key: string) => void;
+  revealP115Secret: RevealSecret;
+  toggleLocalSecret: (key: string) => void;
 }) {
   const libraryOutputRows = useMemo(
     () => p115LibraryOutputRows(console.p115Settings),
@@ -547,13 +694,26 @@ function P115SettingsPanel({
         <div className="formGrid">
           <label className="field wideField">
             <span>STRM 生成地址</span>
-            <input
+            <SecretInput
               value={console.p115Settings.public_base_url}
               placeholder="http://172.16.0.1:8080"
-              onChange={(event) =>
+              visible={secretVisible("p115_public_base_url")}
+              onToggle={() =>
+                revealP115Secret(
+                  "p115_public_base_url",
+                  "public_base_url",
+                  console.p115Settings.public_base_url,
+                  (value) =>
+                    console.setP115Settings({
+                      ...console.p115Settings,
+                      public_base_url: value,
+                    }),
+                )
+              }
+              onChange={(value) =>
                 console.setP115Settings({
                   ...console.p115Settings,
-                  public_base_url: event.target.value,
+                  public_base_url: value,
                 })
               }
             />
@@ -676,7 +836,18 @@ function P115SettingsPanel({
             <SecretInput
               value={console.p115Settings.app_secret}
               visible={secretVisible("p115_app_secret")}
-              onToggle={() => toggleSecret("p115_app_secret")}
+              onToggle={() =>
+                revealP115Secret(
+                  "p115_app_secret",
+                  "app_secret",
+                  console.p115Settings.app_secret,
+                  (value) =>
+                    console.setP115Settings({
+                      ...console.p115Settings,
+                      app_secret: value,
+                    }),
+                )
+              }
               onChange={(value) =>
                 console.setP115Settings({ ...console.p115Settings, app_secret: value })
               }
@@ -688,7 +859,18 @@ function P115SettingsPanel({
               value={console.p115Settings.cookies}
               placeholder="UID=...; CID=...; SEID=..."
               visible={secretVisible("p115_cookies")}
-              onToggle={() => toggleSecret("p115_cookies")}
+              onToggle={() =>
+                revealP115Secret(
+                  "p115_cookies",
+                  "cookies",
+                  console.p115Settings.cookies,
+                  (value) =>
+                    console.setP115Settings({
+                      ...console.p115Settings,
+                      cookies: value,
+                    }),
+                )
+              }
               onChange={(value) =>
                 console.setP115Settings({ ...console.p115Settings, cookies: value })
               }
@@ -742,7 +924,7 @@ function P115SettingsPanel({
               value={console.p115TokenDraft.accessToken}
               placeholder="access_token"
               visible={secretVisible("p115_openlist_access")}
-              onToggle={() => toggleSecret("p115_openlist_access")}
+              onToggle={() => toggleLocalSecret("p115_openlist_access")}
               onChange={(value) =>
                 console.setP115TokenDraft({
                   ...console.p115TokenDraft,
@@ -757,7 +939,7 @@ function P115SettingsPanel({
               value={console.p115TokenDraft.refreshToken}
               placeholder="refresh_token"
               visible={secretVisible("p115_openlist_refresh")}
-              onToggle={() => toggleSecret("p115_openlist_refresh")}
+              onToggle={() => toggleLocalSecret("p115_openlist_refresh")}
               onChange={(value) =>
                 console.setP115TokenDraft({
                   ...console.p115TokenDraft,
@@ -874,11 +1056,11 @@ function P115SettingsPanel({
 function EmbySettings({
   console,
   secretVisible,
-  toggleSecret,
+  revealP115Secret,
 }: {
   console: CurioConsole;
   secretVisible: (key: string) => boolean;
-  toggleSecret: (key: string) => void;
+  revealP115Secret: RevealSecret;
 }) {
   return (
     <Card title="Emby 反代" eyebrow="Playback Proxy">
@@ -886,13 +1068,26 @@ function EmbySettings({
       <div className="formGrid">
         <label className="field">
           <span>Emby 原始地址</span>
-          <input
+          <SecretInput
             value={console.p115Settings.emby_upstream_url}
             placeholder="http://emby:8096"
-            onChange={(event) =>
+            visible={secretVisible("p115_emby_upstream_url")}
+            onToggle={() =>
+              revealP115Secret(
+                "p115_emby_upstream_url",
+                "emby_upstream_url",
+                console.p115Settings.emby_upstream_url,
+                (value) =>
+                  console.setP115Settings({
+                    ...console.p115Settings,
+                    emby_upstream_url: value,
+                  }),
+              )
+            }
+            onChange={(value) =>
               console.setP115Settings({
                 ...console.p115Settings,
-                emby_upstream_url: event.target.value,
+                emby_upstream_url: value,
               })
             }
           />
@@ -902,7 +1097,18 @@ function EmbySettings({
           <SecretInput
             value={console.p115Settings.emby_api_key}
             visible={secretVisible("p115_emby_api_key")}
-            onToggle={() => toggleSecret("p115_emby_api_key")}
+            onToggle={() =>
+              revealP115Secret(
+                "p115_emby_api_key",
+                "emby_api_key",
+                console.p115Settings.emby_api_key,
+                (value) =>
+                  console.setP115Settings({
+                    ...console.p115Settings,
+                    emby_api_key: value,
+                  }),
+              )
+            }
             onChange={(value) =>
               console.setP115Settings({
                 ...console.p115Settings,

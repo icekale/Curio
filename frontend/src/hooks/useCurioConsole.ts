@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   API_URL,
+  apiUsesSameOrigin,
   endpoints,
   getAuthToken,
   isAuthError,
@@ -518,9 +519,35 @@ export function useCurioConsole() {
     let closed = false;
     endpoints
       .authStatus()
-      .then((status) => {
+      .then(async (status) => {
         if (closed) return;
-        setAuthRequired(status.enabled && !getAuthToken());
+        if (!status.enabled) {
+          setAuthToken("");
+          setAuthRequired(false);
+          setAuthChecked(true);
+          return;
+        }
+        if (status.authenticated) {
+          if (apiUsesSameOrigin()) setAuthToken("");
+          setAuthRequired(false);
+          setAuthChecked(true);
+          return;
+        }
+        const token = getAuthToken();
+        if (token) {
+          try {
+            await endpoints.authLogin(token);
+            if (closed) return;
+            setAuthToken(apiUsesSameOrigin() ? "" : token);
+            setAuthRequired(false);
+          } catch {
+            if (closed) return;
+            setAuthRequired(true);
+          }
+          setAuthChecked(true);
+          return;
+        }
+        setAuthRequired(true);
         setAuthChecked(true);
       })
       .catch((error) => {
@@ -545,8 +572,10 @@ export function useCurioConsole() {
     }
     const eventURL = new URL(`${API_URL}/api/events`, window.location.origin);
     const token = getAuthToken();
-    if (token) eventURL.searchParams.set("token", token);
-    const events = new EventSource(eventURL.toString());
+    if (!apiUsesSameOrigin() && token) eventURL.searchParams.set("token", token);
+    const events = new EventSource(eventURL.toString(), {
+      withCredentials: apiUsesSameOrigin(),
+    });
     events.onmessage = () => scheduleLoad(false);
     events.onerror = () => undefined;
     return () => {
@@ -598,7 +627,7 @@ export function useCurioConsole() {
     setBusy(true);
     try {
       const result = await endpoints.authLogin(token);
-      if (result.enabled) setAuthToken(token);
+      if (result.enabled) setAuthToken(apiUsesSameOrigin() ? "" : token);
       setAuthRequired(false);
       setAuthTokenDraft("");
       draftsReady.current = false;
@@ -778,6 +807,14 @@ export function useCurioConsole() {
       setBusy(false);
     }
   }, [directories, showToast]);
+
+  const revealSettingSecret = useCallback(
+    async (scope: "system" | "clouddrive" | "p115", field: string) => {
+      const result = await endpoints.revealSettingSecret({ scope, field });
+      return result.value ?? "";
+    },
+    [],
+  );
 
   const saveSystemSettings = useCallback(async () => {
     setBusy(true);
@@ -1338,6 +1375,7 @@ export function useCurioConsole() {
     openRearchive,
     submitRearchive,
     saveDirectories,
+    revealSettingSecret,
     saveSystemSettings,
     saveClassification,
     saveTemplate,

@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -44,6 +45,8 @@ type API struct {
 	curated    *curated.Service
 	adminToken string
 }
+
+const adminCookieName = "curio_admin_token"
 
 type rearchivePayload struct {
 	TMDBID        int    `json:"tmdb_id"`
@@ -103,6 +106,7 @@ func NewWithServices(store *repository.Store, workerService *worker.Service, scr
 	router.Get("/api/stats", api.stats)
 	router.Get("/api/settings/directories", api.directories)
 	router.Put("/api/settings/directories", api.saveDirectories)
+	router.Post("/api/settings/secrets/reveal", api.revealSettingSecret)
 	router.Get("/api/settings/system", api.systemSettings)
 	router.Put("/api/settings/system", api.saveSystemSettings)
 	router.Get("/api/settings/clouddrive", api.cloudDriveSettings)
@@ -162,17 +166,7 @@ func (a *API) authMiddleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		token := strings.TrimSpace(r.Header.Get("X-Curio-Token"))
-		if token == "" {
-			auth := strings.TrimSpace(r.Header.Get("Authorization"))
-			if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
-				token = strings.TrimSpace(auth[7:])
-			}
-		}
-		if token == "" && r.URL.Path == "/api/events" {
-			token = strings.TrimSpace(r.URL.Query().Get("token"))
-		}
-		if subtle.ConstantTimeCompare([]byte(token), []byte(a.adminToken)) != 1 {
+		if !a.validAdminToken(a.authTokenFromRequest(r)) {
 			writeError(w, http.StatusUnauthorized, "需要 Curio 管理令牌")
 			return
 		}
@@ -181,7 +175,12 @@ func (a *API) authMiddleware(next http.Handler) http.Handler {
 }
 
 func (a *API) authStatus(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"enabled": a.adminToken != ""})
+	token := a.authTokenFromRequest(r)
+	authenticated := a.adminToken == "" || a.validAdminToken(token)
+	if a.adminToken != "" && authenticated {
+		setAdminCookie(w, r, token)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"enabled": a.adminToken != "", "authenticated": authenticated})
 }
 
 func (a *API) authLogin(w http.ResponseWriter, r *http.Request) {
@@ -200,7 +199,68 @@ func (a *API) authLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "管理令牌无效")
 		return
 	}
+	setAdminCookie(w, r, payload.Token)
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "enabled": true})
+}
+
+func (a *API) authTokenFromRequest(r *http.Request) string {
+	token := strings.TrimSpace(r.Header.Get("X-Curio-Token"))
+	if token != "" {
+		return token
+	}
+	auth := strings.TrimSpace(r.Header.Get("Authorization"))
+	if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
+		return strings.TrimSpace(auth[7:])
+	}
+	if cookie, err := r.Cookie(adminCookieName); err == nil {
+		return decodeCookieToken(cookie.Value)
+	}
+	if r.URL.Path == "/api/events" {
+		return strings.TrimSpace(r.URL.Query().Get("token"))
+	}
+	return ""
+}
+
+func (a *API) validAdminToken(token string) bool {
+	token = strings.TrimSpace(token)
+	if a.adminToken == "" {
+		return true
+	}
+	if token == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(token), []byte(a.adminToken)) == 1
+}
+
+func setAdminCookie(w http.ResponseWriter, r *http.Request, token string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     adminCookieName,
+		Value:    encodeCookieToken(strings.TrimSpace(token)),
+		Path:     "/",
+		MaxAge:   30 * 24 * 60 * 60,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   requestIsHTTPS(r),
+	})
+}
+
+func encodeCookieToken(token string) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(token))
+}
+
+func decodeCookieToken(value string) string {
+	decoded, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil {
+		return strings.TrimSpace(value)
+	}
+	return strings.TrimSpace(string(decoded))
+}
+
+func requestIsHTTPS(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https")
 }
 
 func (a *API) events(w http.ResponseWriter, r *http.Request) {
@@ -380,6 +440,89 @@ func (a *API) saveDirectories(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, normalized)
 }
 
+func (a *API) revealSettingSecret(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := contextWithTimeout(r)
+	defer cancel()
+	var payload struct {
+		Scope string `json:"scope"`
+		Field string `json:"field"`
+	}
+	if err := decodeJSON(w, r, &payload); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	scope := strings.TrimSpace(payload.Scope)
+	field := strings.TrimSpace(payload.Field)
+	value, err := a.settingSecretValue(ctx, scope, field)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, map[string]string{"value": value})
+}
+
+func (a *API) settingSecretValue(ctx context.Context, scope, field string) (string, error) {
+	switch scope {
+	case "system":
+		settings, err := a.store.Settings(ctx)
+		if err != nil {
+			return "", err
+		}
+		switch field {
+		case "tmdb_api_key":
+			return settings.TMDBAPIKey, nil
+		case "network_proxy":
+			return settings.NetworkProxy, nil
+		case "ai_base_url":
+			return settings.AIBaseURL, nil
+		case "ai_api_key":
+			return settings.AIAPIKey, nil
+		case "clouddrive_address":
+			return settings.CloudDriveAddress, nil
+		case "clouddrive_username":
+			return settings.CloudDriveUsername, nil
+		case "clouddrive_password":
+			return settings.CloudDrivePassword, nil
+		case "clouddrive_token":
+			return settings.CloudDriveToken, nil
+		}
+	case "clouddrive":
+		settings, err := a.store.CloudDriveSettings(ctx)
+		if err != nil {
+			return "", err
+		}
+		switch field {
+		case "address":
+			return settings.Address, nil
+		case "username":
+			return settings.Username, nil
+		case "password":
+			return settings.Password, nil
+		case "token":
+			return settings.Token, nil
+		}
+	case "p115":
+		settings, err := a.store.P115Settings(ctx)
+		if err != nil {
+			return "", err
+		}
+		switch field {
+		case "app_secret":
+			return settings.AppSecret, nil
+		case "cookies":
+			return settings.Cookies, nil
+		case "public_base_url":
+			return settings.PublicBaseURL, nil
+		case "emby_upstream_url":
+			return settings.EmbyUpstreamURL, nil
+		case "emby_api_key":
+			return settings.EmbyAPIKey, nil
+		}
+	}
+	return "", errors.New("未支持的敏感配置字段")
+}
+
 func (a *API) systemSettings(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := contextWithTimeout(r)
 	defer cancel()
@@ -388,7 +531,7 @@ func (a *API) systemSettings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, settings)
+	writeJSON(w, http.StatusOK, publicSystemSettings(settings))
 }
 
 func (a *API) saveSystemSettings(w http.ResponseWriter, r *http.Request) {
@@ -438,7 +581,7 @@ func (a *API) saveSystemSettings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, saved)
+	writeJSON(w, http.StatusOK, publicSystemSettings(saved))
 }
 
 func (a *API) cloudDriveSettings(w http.ResponseWriter, r *http.Request) {
@@ -449,7 +592,7 @@ func (a *API) cloudDriveSettings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, settings)
+	writeJSON(w, http.StatusOK, publicCloudDriveSettings(settings))
 }
 
 func (a *API) saveCloudDriveSettings(w http.ResponseWriter, r *http.Request) {
@@ -473,7 +616,7 @@ func (a *API) saveCloudDriveSettings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, saved)
+	writeJSON(w, http.StatusOK, publicCloudDriveSettings(saved))
 }
 
 func (a *API) p115Settings(w http.ResponseWriter, r *http.Request) {
@@ -489,7 +632,7 @@ func (a *API) p115Settings(w http.ResponseWriter, r *http.Request) {
 		settings.EmbyProxyPort = 8097
 	}
 	settings.CookieLoginApp = p115.NormalizeCookieLoginApp(settings.CookieLoginApp)
-	writeJSON(w, http.StatusOK, settings)
+	writeJSON(w, http.StatusOK, publicP115Settings(settings))
 }
 
 func (a *API) saveP115Settings(w http.ResponseWriter, r *http.Request) {
@@ -513,7 +656,7 @@ func (a *API) saveP115Settings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, saved)
+	writeJSON(w, http.StatusOK, publicP115Settings(saved))
 }
 
 func (a *API) startP115QRCode(w http.ResponseWriter, r *http.Request) {
@@ -669,7 +812,7 @@ func (a *API) previewP115STRM(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, preview)
+	writeJSON(w, http.StatusOK, publicSTRMPreview(preview))
 }
 
 func (a *API) rebuildP115Nodes(w http.ResponseWriter, r *http.Request) {
@@ -708,7 +851,7 @@ func (a *API) p115SyncRuns(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) p115PlaybackLogs(w http.ResponseWriter, r *http.Request) {
 	limit, offset := paginationFromRequest(r)
-	writeJSON(w, http.StatusOK, playbackLogPage("playback", limit, offset))
+	writeJSON(w, http.StatusOK, publicLogPage(playbackLogPage("playback", limit, offset)))
 }
 
 func (a *API) logs(w http.ResponseWriter, r *http.Request) {
@@ -720,7 +863,7 @@ func (a *API) logs(w http.ResponseWriter, r *http.Request) {
 		logType = "all"
 	}
 	if logType == "playback" {
-		writeJSON(w, http.StatusOK, playbackLogPage(logType, limit, offset))
+		writeJSON(w, http.StatusOK, publicLogPage(playbackLogPage(logType, limit, offset)))
 		return
 	}
 	dbLimit, dbOffset := limit, offset
@@ -763,7 +906,7 @@ func (a *API) logs(w http.ResponseWriter, r *http.Request) {
 		page.Limit = limit
 		page.Offset = offset
 	}
-	writeJSON(w, http.StatusOK, page)
+	writeJSON(w, http.StatusOK, publicLogPage(page))
 }
 
 func (a *API) logDetail(w http.ResponseWriter, r *http.Request) {
@@ -774,7 +917,7 @@ func (a *API) logDetail(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "日志不存在")
 		return
 	}
-	writeJSON(w, http.StatusOK, entry)
+	writeJSON(w, http.StatusOK, publicLogEntry(entry))
 }
 
 func playbackLogPage(logType string, limit, offset int) models.LogPage {
@@ -1327,6 +1470,74 @@ func validateCloudDriveSettings(settings models.CloudDriveSettings) (models.Clou
 
 const hiddenSecretValue = "********"
 
+func publicSystemSettings(settings models.SystemSettings) models.SystemSettings {
+	settings.TMDBAPIKey = redactedValue(settings.TMDBAPIKey)
+	settings.NetworkProxy = redactedValue(settings.NetworkProxy)
+	settings.AIBaseURL = redactedValue(settings.AIBaseURL)
+	settings.AIAPIKey = redactedValue(settings.AIAPIKey)
+	settings.CloudDriveAddress = redactedValue(settings.CloudDriveAddress)
+	settings.CloudDriveUsername = redactedValue(settings.CloudDriveUsername)
+	settings.CloudDrivePassword = redactedValue(settings.CloudDrivePassword)
+	settings.CloudDriveToken = redactedValue(settings.CloudDriveToken)
+	return settings
+}
+
+func publicCloudDriveSettings(settings models.CloudDriveSettings) models.CloudDriveSettings {
+	settings.Address = redactedValue(settings.Address)
+	settings.Username = redactedValue(settings.Username)
+	settings.Password = redactedValue(settings.Password)
+	settings.Token = redactedValue(settings.Token)
+	return settings
+}
+
+func publicP115Settings(settings models.P115Settings) models.P115Settings {
+	settings.AppSecret = redactedValue(settings.AppSecret)
+	settings.Cookies = redactedValue(settings.Cookies)
+	settings.PublicBaseURL = redactedValue(settings.PublicBaseURL)
+	settings.EmbyUpstreamURL = redactedValue(settings.EmbyUpstreamURL)
+	settings.EmbyPublicURL = ""
+	settings.EmbyAPIKey = redactedValue(settings.EmbyAPIKey)
+	return settings
+}
+
+func publicSTRMPreview(preview models.STRMPreview) models.STRMPreview {
+	for i := range preview.Items {
+		preview.Items[i].PlayPath = pathOnlyURL(preview.Items[i].PlayPath)
+	}
+	return preview
+}
+
+func publicLogPage(page models.LogPage) models.LogPage {
+	for i := range page.Items {
+		page.Items[i] = publicLogEntry(page.Items[i])
+	}
+	return page
+}
+
+func publicLogEntry(entry models.LogEntry) models.LogEntry {
+	entry.BaseURL = redactedValue(entry.BaseURL)
+	entry.ProxyURL = redactedValue(entry.ProxyURL)
+	return entry
+}
+
+func pathOnlyURL(value string) string {
+	parsed, err := url.Parse(strings.TrimSpace(value))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return value
+	}
+	if parsed.RawQuery != "" {
+		return parsed.EscapedPath() + "?" + parsed.RawQuery
+	}
+	return parsed.EscapedPath()
+}
+
+func redactedValue(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return ""
+	}
+	return hiddenSecretValue
+}
+
 func isHiddenSecret(value string) bool {
 	value = strings.TrimSpace(value)
 	return value != "" && strings.Trim(value, "*") == ""
@@ -1336,8 +1547,20 @@ func mergeHiddenSystemSettings(next *models.SystemSettings, existing models.Syst
 	if isHiddenSecret(next.TMDBAPIKey) {
 		next.TMDBAPIKey = existing.TMDBAPIKey
 	}
+	if isHiddenSecret(next.NetworkProxy) {
+		next.NetworkProxy = existing.NetworkProxy
+	}
+	if isHiddenSecret(next.AIBaseURL) {
+		next.AIBaseURL = existing.AIBaseURL
+	}
 	if isHiddenSecret(next.AIAPIKey) {
 		next.AIAPIKey = existing.AIAPIKey
+	}
+	if isHiddenSecret(next.CloudDriveAddress) {
+		next.CloudDriveAddress = existing.CloudDriveAddress
+	}
+	if isHiddenSecret(next.CloudDriveUsername) {
+		next.CloudDriveUsername = existing.CloudDriveUsername
 	}
 	if isHiddenSecret(next.CloudDrivePassword) {
 		next.CloudDrivePassword = existing.CloudDrivePassword
@@ -1348,6 +1571,12 @@ func mergeHiddenSystemSettings(next *models.SystemSettings, existing models.Syst
 }
 
 func mergeHiddenCloudDriveSettings(next *models.CloudDriveSettings, existing models.CloudDriveSettings) {
+	if isHiddenSecret(next.Address) {
+		next.Address = existing.Address
+	}
+	if isHiddenSecret(next.Username) {
+		next.Username = existing.Username
+	}
 	if isHiddenSecret(next.Password) {
 		next.Password = existing.Password
 	}
@@ -1365,6 +1594,12 @@ func mergeHiddenP115Settings(next *models.P115Settings, existing models.P115Sett
 	}
 	if isHiddenSecret(next.Cookies) {
 		next.Cookies = existing.Cookies
+	}
+	if isHiddenSecret(next.PublicBaseURL) {
+		next.PublicBaseURL = existing.PublicBaseURL
+	}
+	if isHiddenSecret(next.EmbyUpstreamURL) {
+		next.EmbyUpstreamURL = existing.EmbyUpstreamURL
 	}
 	if isHiddenSecret(next.EmbyAPIKey) {
 		next.EmbyAPIKey = existing.EmbyAPIKey

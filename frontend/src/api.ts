@@ -57,6 +57,16 @@ export function setAuthToken(token: string) {
   }
 }
 
+export function apiUsesSameOrigin() {
+  if (typeof window === "undefined") return API_URL === "";
+  if (!API_URL) return true;
+  try {
+    return new URL(API_URL, window.location.origin).origin === window.location.origin;
+  } catch {
+    return false;
+  }
+}
+
 export function isAuthError(error: unknown) {
   return error instanceof CurioAuthError;
 }
@@ -146,6 +156,11 @@ export const endpoints = {
   saveDirectories: (payload: unknown) =>
     api<DirectoryConfig>("/api/settings/directories", {
       method: "PUT",
+      body: JSON.stringify(payload),
+    }),
+  revealSettingSecret: (payload: unknown) =>
+    api<{ value: string }>("/api/settings/secrets/reveal", {
+      method: "POST",
       body: JSON.stringify(payload),
     }),
   systemSettings: () => api<SystemSettings>("/api/settings/system"),

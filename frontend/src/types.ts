@@ -400,6 +400,7 @@ export type Health = {
 
 export type AuthStatus = {
   enabled: boolean;
+  authenticated: boolean;
 };
 
 export type AuthLoginResult = {
